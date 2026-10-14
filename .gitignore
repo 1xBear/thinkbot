@@ -1,0 +1,13 @@
+cd ~/.config/thinkbot
+cat << 'EOF' > .gitignore
+# Build output
+/target/
+
+# Local runtime configuration (contains user-specific paths)
+config.toml
+
+# OS / Editor clutter
+*.swp
+*~
+.DS_Store
+EOF

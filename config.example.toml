@@ -1,0 +1,4 @@
+download_dir = "~/Downloads/"
+theme = "GruvboxDark"
+embed_subtitles = false
+concurrent_fragments = 4
