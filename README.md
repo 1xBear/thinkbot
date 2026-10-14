@@ -2,6 +2,8 @@
 
 A lightweight Linux terminal dashboard. Functions include theme selection, yt-dlp integration, hardware status, and more.
 
+IMPORTANT: This repo is in early infancy, and may not work on every machine or OS. As a personal project, this is known to work on Arch Linux (wayland).
+
 ## Features
 
 - **System Overview:** Live hardware stats (load, memory, battery, thermal) polled directly from `/proc` and `/sys`.
