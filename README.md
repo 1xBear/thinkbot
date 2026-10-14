@@ -1,6 +1,6 @@
 # thinkbot
 
-A lightweight Linux terminal dashboard and `yt-dlp` media downloader built with Rust and Ratatui.
+A lightweight Linux terminal dashboard. Functions include theme selection, yt-dlp integration, hardware status, and more.
 
 ## Features
 
