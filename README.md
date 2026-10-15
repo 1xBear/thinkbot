@@ -20,7 +20,7 @@ IMPORTANT: This repo is in early infancy, and may not work on every machine or O
 ## Installation
 
 ```bash
-git clone [https://github.com/](https://github.com/)<YOUR_USERNAME>/thinkbot.git
+git clone [https://github.com/](https://github.com/)1xBear/thinkbot.git
 cd thinkbot
 cargo build --release
 install -Dm755 target/release/thinkbot ~/.local/bin/thinkbot
