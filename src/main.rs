@@ -1,4 +1,17 @@
-//! thinkbot — a small ratatui control panel with a yt-dlp front-end.
+//! thinkbot — a lightweight Linux system monitor and `yt-dlp` terminal UI.
+//!
+//! Architecture overview:
+//! - **Host Telemetry (`StaticHostInfo`, `SystemSnapshot`):** Static system properties
+//!   (OS name, kernel release, root mount type, desktop session, sysfs sensor paths)
+//!   are resolved once on startup. Dynamic metrics (CPU usage via `/proc/stat` deltas,
+//!   available memory via `/proc/meminfo`, load average, battery, and package temperature)
+//!   are polled on a 2-second interval.
+//! - **Media Downloader (`Downloader`, `Job`):** Spawns `yt-dlp` in a background worker
+//!   thread while streaming stdout/stderr into a bounded `VecDeque` ring buffer. A shared
+//!   `AtomicBool` cancellation flag allows immediate subprocess termination either by
+//!   user request or when the application exits.
+//! - **Render Loop (`run`, `ui`):** Uses a `dirty` flag and adaptive poll timeouts so
+//!   Ratatui only redraws the terminal when state actually changes.
 
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -25,17 +38,28 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Event poll interval while a background download is actively streaming output.
 const ACTIVE_TICK: Duration = Duration::from_millis(80);
+
+/// Maximum event poll interval when the application is idle.
 const IDLE_TICK: Duration = Duration::from_millis(500);
+
+/// Interval between `/proc` and `/sys` telemetry refreshes.
 const SYSTEM_REFRESH: Duration = Duration::from_secs(2);
+
+/// Maximum number of `yt-dlp` output lines retained in memory per job.
 const MAX_LOG_LINES: usize = 200;
+
+/// Foreground text color used on top of bright accent backgrounds.
+/// Uses an explicit RGB value rather than `Color::Black` so custom terminal
+/// ANSI palettes do not wash out highlighted items.
 const ON_ACCENT: Color = hex(0x11111b);
 
-// ---------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------
+// =========================================================================
+// General Utilities & Text Input Helpers
+// =========================================================================
 
-/// Wrap `idx + delta` into `0..len`.
+/// Modular arithmetic helper to cycle `idx` by `delta` within `0..len`.
 fn wrap(idx: usize, len: usize, delta: i32) -> usize {
     if len == 0 {
         return 0;
@@ -43,10 +67,12 @@ fn wrap(idx: usize, len: usize, delta: i32) -> usize {
     (idx as i32 + delta).rem_euclid(len as i32) as usize
 }
 
+/// Reads `$HOME` from the process environment.
 fn home() -> Option<String> {
     env::var("HOME").ok()
 }
 
+/// Expands a leading `~` or `~/...` prefix into the user's home directory.
 fn expand_tilde(path: &str) -> PathBuf {
     let trimmed = path.trim();
     if trimmed == "~" {
@@ -60,11 +86,12 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// Reads a file to a `String` and trims surrounding whitespace.
 fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-/// Check if an executable exists in `$PATH`.
+/// Checks whether an executable named `bin` exists in any directory in `$PATH`.
 fn has_command(bin: &str) -> bool {
     env::var_os("PATH").is_some_and(|paths| {
         env::split_paths(&paths).any(|dir| {
@@ -74,7 +101,9 @@ fn has_command(bin: &str) -> bool {
     })
 }
 
-/// Last `n` characters of `s` (keeps the text cursor visible in narrow inputs).
+/// Returns a borrowed slice of the last `n` Unicode scalar values in `s`.
+/// Used by single-line text inputs so the cursor stays visible when a URL or path
+/// exceeds the width of the input box.
 fn tail_chars(s: &str, n: usize) -> &str {
     let total = s.chars().count();
     let skip = total.saturating_sub(n);
@@ -84,6 +113,7 @@ fn tail_chars(s: &str, n: usize) -> &str {
     }
 }
 
+/// Maps vertical navigation keys (`j`/`Down` and `k`/`Up`) to index deltas.
 fn vertical(code: KeyCode) -> Option<i32> {
     match code {
         KeyCode::Down | KeyCode::Char('j') => Some(1),
@@ -92,11 +122,13 @@ fn vertical(code: KeyCode) -> Option<i32> {
     }
 }
 
+/// Returns `true` if `code` is a backward navigation key (`h`, `Left`, or `Backspace`).
 fn is_back(code: KeyCode) -> bool {
     matches!(code, KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h'))
 }
 
-/// Delete the last word/segment from `buf` (Ctrl+W behavior).
+/// Deletes the trailing word or URL/path segment from `buf` (`Ctrl+W` / `Ctrl+Backspace`).
+/// Stops at whitespace as well as common URL/path delimiters (`/`, `&`, `?`).
 fn pop_word(buf: &mut String) {
     let trimmed_len = buf.trim_end().len();
     buf.truncate(trimmed_len);
@@ -111,7 +143,9 @@ fn pop_word(buf: &mut String) {
     }
 }
 
-/// Apply a key to a text buffer. Returns true if the key was consumed.
+/// Processes a single key press against a mutable text buffer.
+/// Supports standard character insertion, `Backspace`, `Ctrl+U` (clear line),
+/// and `Ctrl+W` / `Ctrl+Backspace` (delete previous word/segment).
 fn edit_text(buf: &mut String, key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match (key.code, ctrl) {
@@ -127,14 +161,16 @@ fn edit_text(buf: &mut String, key: KeyEvent) -> bool {
     true
 }
 
-// ---------------------------------------------------------
-// Themes
-// ---------------------------------------------------------
+// =========================================================================
+// Theme Engine & Color Palettes
+// =========================================================================
 
+/// Converts a 24-bit `0xRRGGBB` literal into a `ratatui::style::Color`.
 const fn hex(c: u32) -> Color {
     Color::Rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
+/// Semantic color slots used across all UI widgets.
 #[derive(Clone, Copy)]
 struct Palette {
     primary: Color,
@@ -147,6 +183,7 @@ struct Palette {
     danger: Color,
 }
 
+/// Built-in color themes persisted in `config.toml`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Theme {
     CatppuccinMocha,
@@ -170,6 +207,7 @@ enum Theme {
 }
 
 impl Theme {
+    /// Ordered list of all selectable themes in the Settings panel.
     const ALL: [Theme; 18] = [
         Theme::CatppuccinMocha,
         Theme::CatppuccinMacchiato,
@@ -191,6 +229,7 @@ impl Theme {
         Theme::Cyberpunk,
     ];
 
+    /// Human-readable display name shown in the UI.
     const fn name(self) -> &'static str {
         match self {
             Theme::CatppuccinMocha => "Catppuccin Mocha",
@@ -214,13 +253,15 @@ impl Theme {
         }
     }
 
+    /// Steps forward or backward through `Theme::ALL`.
     fn cycle(self, delta: i32) -> Self {
         let i = Self::ALL.iter().position(|&t| t == self).unwrap_or(0);
         Self::ALL[wrap(i, Self::ALL.len(), delta)]
     }
 
+    /// Maps a `Theme` variant to its 8 semantic colors:
+    /// `[primary, secondary, highlight, text, dim, surface, success, danger]`.
     const fn palette(self) -> Palette {
-        // primary, secondary, highlight, text, dim, surface, success, danger
         let c = match self {
             Theme::CatppuccinMocha => [
                 0x89b4fa, 0xcba6f7, 0xf9e2af, 0xcdd6f4, 0x6c7086, 0x313244, 0xa6e3a1, 0xf38ba8,
@@ -290,10 +331,11 @@ impl Theme {
     }
 }
 
-// ---------------------------------------------------------
-// Config
-// ---------------------------------------------------------
+// =========================================================================
+// Configuration Persistence
+// =========================================================================
 
+/// User configuration serialized to `$XDG_CONFIG_HOME/thinkbot/config.toml`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(default)]
 struct Config {
@@ -315,6 +357,8 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Resolves the configuration file path (`$XDG_CONFIG_HOME/thinkbot/config.toml`
+    /// or `~/.config/thinkbot/config.toml`).
     fn path() -> PathBuf {
         let base = env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -322,6 +366,8 @@ impl Config {
         base.join("thinkbot").join("config.toml")
     }
 
+    /// Loads `config.toml` from disk, falling back to `Config::default()` if missing
+    /// or malformed. Clamps `concurrent_fragments` to `1..=16`.
     fn load() -> Self {
         let mut cfg: Self = read_trimmed(Self::path())
             .and_then(|s| toml::from_str(&s).ok())
@@ -330,6 +376,7 @@ impl Config {
         cfg
     }
 
+    /// Writes the current configuration to disk, creating parent directories if needed.
     fn save(&self) -> io::Result<()> {
         let path = Self::path();
         if let Some(parent) = path.parent() {
@@ -340,10 +387,11 @@ impl Config {
     }
 }
 
-// ---------------------------------------------------------
-// Navigation
-// ---------------------------------------------------------
+// =========================================================================
+// Sidebar Navigation & Focus State
+// =========================================================================
 
+/// Top-level panels accessible from the left navigation sidebar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Menu {
     Overview,
@@ -375,22 +423,25 @@ impl Menu {
         }
     }
 
-    /// Overview, Help, and Update do not take inner content focus (Update triggers immediately on Enter).
+    /// Returns `true` if pressing `Enter` moves keyboard focus into the right-hand panel.
+    /// `Overview` and `Help` are read-only views, and `Update` triggers an immediate action.
     const fn is_enterable(self) -> bool {
         !matches!(self, Menu::Overview | Menu::Help | Menu::Update)
     }
 }
 
+/// Tracks which pane currently receives directional and action keys.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Sidebar,
     Content,
 }
 
-// ---------------------------------------------------------
-// Downloader
-// ---------------------------------------------------------
+// =========================================================================
+// Media Downloader & Subprocess Management
+// =========================================================================
 
+/// Target media stream type for `yt-dlp`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Video,
@@ -407,6 +458,7 @@ impl Kind {
         }
     }
 
+    /// Supported output container/codec extensions for each media type.
     const fn formats(self) -> &'static [&'static str] {
         match self {
             Kind::Video => &["mp4", "mkv", "webm", "mov"],
@@ -415,6 +467,7 @@ impl Kind {
     }
 }
 
+/// Step state machine for the downloader wizard.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Step {
     Url,
@@ -424,6 +477,7 @@ enum Step {
     Done,
 }
 
+/// Lifecycle state of a background `yt-dlp` process.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum JobState {
     #[default]
@@ -433,13 +487,20 @@ enum JobState {
     Cancelled,
 }
 
-/// Output of a running yt-dlp process, shared with the UI thread.
+/// Shared state between a background `yt-dlp` worker thread and the UI thread.
 struct Job {
+    /// Bounded ring buffer of trimmed stdout/stderr lines.
     lines: VecDeque<String>,
+    /// Latest parsed download percentage (`0.0..=100.0`).
     percent: f64,
+    /// Latest parsed transfer speed (e.g., `"5.20MiB/s"`).
     speed: Option<String>,
+    /// Latest parsed estimated time remaining (e.g., `"00:12"`).
     eta: Option<String>,
+    /// Execution status of the child process.
     state: JobState,
+    /// Monotonically increasing counter incremented on every state or log update.
+    /// Allows the UI thread to skip redraws when nothing changed.
     version: u64,
 }
 
@@ -456,11 +517,15 @@ impl Default for Job {
     }
 }
 
+/// Identifies `yt-dlp` progress lines such as:
+/// `[download]  45.0% of   50.00MiB at    6.10MiB/s ETA 00:05`
 fn is_progress(line: &str) -> bool {
     line.starts_with("[download]") && line.contains("% of")
 }
 
 impl Job {
+    /// Appends a line of output from `yt-dlp`, parsing progress telemetry and
+    /// collapsing consecutive `[download] ... % of ...` updates in-place.
     fn push(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() {
@@ -474,7 +539,6 @@ impl Job {
             {
                 self.percent = pct.parse().unwrap_or(self.percent);
             }
-            // Extract speed ("at 5.20MiB/s") and ETA ("ETA 00:12") if present.
             if let Some(after_at) = line.split(" at ").nth(1) {
                 let mut parts = after_at.split_whitespace();
                 if let Some(spd) = parts.next() {
@@ -490,7 +554,7 @@ impl Job {
                     }
                 }
             }
-            // Collapse consecutive progress lines into one.
+            // Replace the previous progress line instead of flooding the log view.
             if self.lines.back().is_some_and(|l| is_progress(l)) {
                 self.lines.pop_back();
             }
@@ -503,6 +567,7 @@ impl Job {
     }
 }
 
+/// Immutable parameters passed to `run_download` when starting a job.
 #[derive(Clone)]
 struct Request {
     url: String,
@@ -513,6 +578,8 @@ struct Request {
     threads: u8,
 }
 
+/// Spawns a reader thread that drains a child pipe (`stdout` or `stderr`) line-by-line
+/// into the shared `Job` buffer.
 fn pump(reader: impl Read + Send + 'static, job: Arc<Mutex<Job>>) -> JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
@@ -523,6 +590,8 @@ fn pump(reader: impl Read + Send + 'static, job: Arc<Mutex<Job>>) -> JoinHandle<
     })
 }
 
+/// Launches `run_download` on a background thread and returns the shared `Job` state
+/// and cancellation flag.
 fn spawn_download(req: Request) -> (Arc<Mutex<Job>>, Arc<AtomicBool>) {
     let job = Arc::new(Mutex::new(Job::default()));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -532,10 +601,14 @@ fn spawn_download(req: Request) -> (Arc<Mutex<Job>>, Arc<AtomicBool>) {
     (job, cancel)
 }
 
+/// Executes `yt-dlp` as a child process and polls for completion or cancellation.
 fn run_download(req: Request, job: Arc<Mutex<Job>>, cancel: Arc<AtomicBool>) {
     if let Err(e) = fs::create_dir_all(&req.dir) {
         if let Ok(mut j) = job.lock() {
-            j.push(&format!("Failed to create output directory {}: {e}", req.dir.display()));
+            j.push(&format!(
+                "Failed to create output directory {}: {e}",
+                req.dir.display()
+            ));
             j.state = JobState::Failed;
         }
         return;
@@ -557,7 +630,7 @@ fn run_download(req: Request, job: Arc<Mutex<Job>>, cancel: Arc<AtomicBool>) {
         }
     };
 
-    // `--` stops a pasted "URL" from ever being parsed as an option.
+    // `--` prevents a leading hyphen in the URL string from being parsed as a CLI flag.
     cmd.arg("--")
         .arg(&req.url)
         .stdin(Stdio::null())
@@ -585,6 +658,8 @@ fn run_download(req: Request, job: Arc<Mutex<Job>>, cancel: Arc<AtomicBool>) {
         child.stderr.take().map(|e| pump(e, Arc::clone(&job))),
     ];
 
+    // Poll `try_wait` every 50ms so we can respond promptly to the cancellation flag
+    // without blocking indefinitely on `child.wait()`.
     let status = loop {
         if cancel.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -629,6 +704,7 @@ fn run_download(req: Request, job: Arc<Mutex<Job>>, cancel: Arc<AtomicBool>) {
     }
 }
 
+/// UI state for the media downloader wizard.
 struct Downloader {
     step: Step,
     url: String,
@@ -666,6 +742,7 @@ impl Downloader {
         self.formats()[self.format_idx]
     }
 
+    /// Signals the background worker thread to terminate the running `yt-dlp` process.
     fn cancel_running(&self) {
         if self.step == Step::Running {
             self.cancel.store(true, Ordering::Relaxed);
@@ -673,6 +750,7 @@ impl Downloader {
     }
 }
 
+/// Completed, failed, or cancelled job record displayed in the Analytics panel.
 struct HistoryEntry {
     url: String,
     kind: Kind,
@@ -681,10 +759,11 @@ struct HistoryEntry {
     elapsed_secs: u64,
 }
 
-// ---------------------------------------------------------
-// Settings
-// ---------------------------------------------------------
+// =========================================================================
+// Settings Panel State
+// =========================================================================
 
+/// Interactive fields within the Settings panel.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
     Path,
@@ -704,12 +783,14 @@ impl Field {
     ];
 }
 
+/// Manages in-memory configuration edits and tracks whether changes have been written to disk.
 struct Settings {
     cfg: Config,
     saved_cfg: Config,
     field: usize,
-    /// `Some(buffer)` while the download path is being edited.
+    /// Holds the temporary edit buffer while the user is typing a new download directory path.
     editing: Option<String>,
+    /// Last save result message and success flag (`true` = saved, `false` = I/O error).
     status: Option<(String, bool)>,
 }
 
@@ -725,6 +806,7 @@ impl Settings {
         }
     }
 
+    /// Returns `true` if the active in-memory config differs from the last saved state on disk.
     fn is_dirty(&self) -> bool {
         self.cfg != self.saved_cfg
     }
@@ -764,11 +846,11 @@ impl Settings {
     }
 }
 
-// ---------------------------------------------------------
-// Host metrics (cached static info + polled dynamic telemetry)
-// ---------------------------------------------------------
+// =========================================================================
+// Host Telemetry (Static Detection + Dynamic Polling)
+// =========================================================================
 
-/// Static host attributes resolved once at startup.
+/// Host properties and sysfs sensor paths resolved once at startup.
 struct StaticHostInfo {
     os: String,
     host: String,
@@ -783,6 +865,7 @@ struct StaticHostInfo {
 
 impl StaticHostInfo {
     fn detect() -> Self {
+        // Parse `PRETTY_NAME` from `/etc/os-release`.
         let os_name = read_trimmed("/etc/os-release")
             .and_then(|s| {
                 s.lines().find_map(|l| {
@@ -792,6 +875,7 @@ impl StaticHostInfo {
             })
             .unwrap_or_else(|| "Linux".into());
 
+        // Find the filesystem type for the `/` mount in `/proc/mounts`.
         let root_fs = read_trimmed("/proc/mounts")
             .and_then(|s| {
                 s.lines()
@@ -809,6 +893,7 @@ impl StaticHostInfo {
             _ => "unknown".into(),
         };
 
+        // Locate the first `BAT*` entry under `/sys/class/power_supply`.
         let battery_dir = fs::read_dir("/sys/class/power_supply")
             .ok()
             .and_then(|entries| {
@@ -818,6 +903,7 @@ impl StaticHostInfo {
                     .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("BAT")))
             });
 
+        // Prefer the `x86_pkg_temp` thermal zone if available; otherwise use the first zone.
         let thermal_zone = fs::read_dir("/sys/class/thermal").ok().and_then(|entries| {
             let mut zones: Vec<PathBuf> = entries
                 .flatten()
@@ -848,18 +934,22 @@ impl StaticHostInfo {
         }
     }
 
+    /// Re-checks whether `yt-dlp` and `ffmpeg` are present in `$PATH`.
     fn refresh_tools(&mut self) {
         self.has_ytdlp = has_command("yt-dlp");
         self.has_ffmpeg = has_command("ffmpeg");
     }
 }
 
+/// Cumulative CPU jiffies read from the first `cpu` line of `/proc/stat`.
 #[derive(Clone, Copy, Default)]
 struct CpuSample {
     total: u64,
     idle: u64,
 }
 
+/// Reads aggregate CPU time counters from `/proc/stat`.
+/// Fields are: user, nice, system, idle, iowait, irq, softirq, steal.
 fn read_cpu_sample() -> Option<CpuSample> {
     let stat = fs::read_to_string("/proc/stat").ok()?;
     let line = stat.lines().next()?;
@@ -872,10 +962,11 @@ fn read_cpu_sample() -> Option<CpuSample> {
         return None;
     }
     let total: u64 = vals.iter().sum();
-    let idle = vals[3] + vals.get(4).copied().unwrap_or(0); // idle + iowait
+    let idle = vals[3] + vals.get(4).copied().unwrap_or(0);
     Some(CpuSample { total, idle })
 }
 
+/// Dynamic host telemetry refreshed every `SYSTEM_REFRESH` (2 seconds).
 struct SystemSnapshot {
     uptime: String,
     load: String,
@@ -887,6 +978,7 @@ struct SystemSnapshot {
     temp_c: Option<u16>,
 }
 
+/// Formats uptime seconds into `Xd Xh Xm` or `Xh Xm`.
 fn format_uptime(secs: u64) -> String {
     let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
     if d > 0 {
@@ -897,6 +989,8 @@ fn format_uptime(secs: u64) -> String {
 }
 
 impl SystemSnapshot {
+    /// Polls `/proc/uptime`, `/proc/meminfo`, `/proc/stat`, `/proc/loadavg`,
+    /// and the cached battery/thermal sensor paths.
     fn poll(host: &StaticHostInfo, prev: Option<CpuSample>) -> Self {
         let uptime_secs = read_trimmed("/proc/uptime")
             .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
@@ -907,15 +1001,24 @@ impl SystemSnapshot {
         let mut avail = 0u64;
         for line in meminfo.lines() {
             if let Some(rest) = line.strip_prefix("MemTotal:") {
-                total = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                total = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
             } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                avail = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                avail = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
             }
             if total > 0 && avail > 0 {
                 break;
             }
         }
 
+        // Compute CPU utilization percentage over the interval since `prev`.
         let curr_cpu = read_cpu_sample();
         let cpu_pct = match (prev, curr_cpu) {
             (Some(p), Some(c)) => {
@@ -953,9 +1056,9 @@ impl SystemSnapshot {
     }
 }
 
-// ---------------------------------------------------------
-// App
-// ---------------------------------------------------------
+// =========================================================================
+// Application Root State & Lifecycle
+// =========================================================================
 
 struct App {
     menu: usize,
@@ -993,6 +1096,8 @@ impl App {
         }
     }
 
+    /// Saves any pending configuration edits and signals the main loop to exit
+    /// into `rebuild_and_restart()`.
     fn trigger_rebuild(&mut self) {
         if self.settings.is_dirty() {
             let _ = self.settings.cfg.save();
@@ -1040,7 +1145,8 @@ impl App {
         self.dirty = true;
     }
 
-    /// Periodic housekeeping: refresh metrics and detect finished downloads.
+    /// Periodic maintenance: refreshes `/proc` and `/sys` metrics when `SYSTEM_REFRESH`
+    /// elapses and transitions finished background downloads into `Step::Done`.
     fn tick(&mut self) {
         if self.last_poll.elapsed() >= SYSTEM_REFRESH {
             self.sys = SystemSnapshot::poll(&self.host, self.sys.prev_cpu);
@@ -1060,10 +1166,7 @@ impl App {
                 self.dirty = true;
             }
             if state != JobState::Running {
-                let elapsed_secs = self
-                    .dl
-                    .started_at
-                    .map_or(0, |t| t.elapsed().as_secs());
+                let elapsed_secs = self.dl.started_at.map_or(0, |t| t.elapsed().as_secs());
                 self.history.push(HistoryEntry {
                     url: self.dl.url.trim().to_string(),
                     kind: self.dl.kind(),
@@ -1081,10 +1184,12 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Ensure any running `yt-dlp` subprocess is terminated when `App` is dropped.
         self.dl.cancel_running();
     }
 }
 
+/// Resolves the source repository path for in-app rebuilds.
 fn project_dir() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     if manifest_dir.join("Cargo.toml").is_file() {
@@ -1094,6 +1199,8 @@ fn project_dir() -> PathBuf {
     }
 }
 
+/// Pulls latest git changes (if clean), runs `cargo build --release`, atomically updates
+/// `~/.local/bin/thinkbot`, and replaces the current process via `exec()`.
 fn rebuild_and_restart() -> io::Result<()> {
     let dir = project_dir();
     let manifest = dir.join("Cargo.toml");
@@ -1122,7 +1229,8 @@ fn rebuild_and_restart() -> io::Result<()> {
 
     match build_status {
         Ok(s) if s.success() && built_bin.is_file() => {
-            // Also atomically update ~/.local/bin/thinkbot if ~/.local/bin exists.
+            // Copy to a temporary file and rename over `~/.local/bin/thinkbot` so Linux
+            // never returns ETXTBSY ("Text file busy") when updating a running binary.
             if let Some(h) = home() {
                 let local_bin_dir = PathBuf::from(h).join(".local/bin");
                 if local_bin_dir.is_dir() {
@@ -1154,7 +1262,8 @@ fn rebuild_and_restart() -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    // `init` also installs a panic hook, so the terminal is restored on crash.
+    // `ratatui::init` enters the alternate screen, enables raw mode, and installs a panic
+    // hook that restores the terminal before printing panic backtraces.
     let mut terminal = ratatui::init();
     let (result, rebuild) = run(&mut terminal);
     ratatui::restore();
@@ -1165,6 +1274,8 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// Main event loop. Redraws only when `app.dirty` is set and coalesces bursts of
+/// input events (such as bracketed pastes) into a single frame render.
 fn run(terminal: &mut DefaultTerminal) -> (io::Result<()>, bool) {
     let mut app = App::new();
     while !app.quit {
@@ -1183,7 +1294,7 @@ fn run(terminal: &mut DefaultTerminal) -> (io::Result<()>, bool) {
 
         match event::poll(timeout) {
             Ok(true) => {
-                // Drain everything pending so a large paste costs one redraw.
+                // Drain all queued terminal events before rendering the next frame.
                 loop {
                     match event::read() {
                         Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
@@ -1216,10 +1327,11 @@ fn run(terminal: &mut DefaultTerminal) -> (io::Result<()>, bool) {
     (Ok(()), app.rebuild)
 }
 
-// ---------------------------------------------------------
-// Input
-// ---------------------------------------------------------
+// =========================================================================
+// Keyboard & Paste Input Dispatch
+// =========================================================================
 
+/// Appends pasted text (stripped of control characters/newlines) into the active text input.
 fn on_paste(app: &mut App, text: &str) {
     let clean: String = text.chars().filter(|&c| !c.is_control()).collect();
     if clean.is_empty() {
@@ -1238,6 +1350,8 @@ fn on_paste(app: &mut App, text: &str) {
     }
 }
 
+/// Top-level keyboard router. `Ctrl+C` always exits immediately; all other keys are
+/// routed based on whether focus is in the sidebar or the active content panel.
 fn on_key(app: &mut App, key: KeyEvent) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.quit = true;
@@ -1309,8 +1423,6 @@ fn download_key(app: &mut App, key: KeyEvent) {
                 }
             }
         },
-        // The download keeps running in the background if you leave with Esc,
-        // or can be cancelled with 'c' / 'x'.
         Step::Running => match code {
             KeyCode::Esc => app.focus = Focus::Sidebar,
             KeyCode::Char('c') | KeyCode::Char('x') => app.dl.cancel_running(),
@@ -1334,7 +1446,8 @@ fn analytics_key(app: &mut App, code: KeyCode) {
             app.history_idx = 0;
         }
         KeyCode::Enter | KeyCode::Char('r') if !app.history.is_empty() => {
-            // History is displayed newest-first, so map `history_idx` back to the slice index.
+            // History entries are rendered newest-first; convert the visual row index
+            // back to the underlying `Vec` index.
             let rev_idx = app.history.len().saturating_sub(1 + app.history_idx);
             if let Some(entry) = app.history.get(rev_idx) {
                 app.dl.url = entry.url.clone();
@@ -1346,7 +1459,10 @@ fn analytics_key(app: &mut App, code: KeyCode) {
                     .position(|&f| f == entry.format)
                     .unwrap_or(0);
                 app.dl.step = Step::Format;
-                app.menu = Menu::ALL.iter().position(|&m| m == Menu::Download).unwrap_or(1);
+                app.menu = Menu::ALL
+                    .iter()
+                    .position(|&m| m == Menu::Download)
+                    .unwrap_or(1);
                 app.focus = Focus::Content;
             }
         }
@@ -1398,10 +1514,11 @@ fn settings_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-// ---------------------------------------------------------
-// Shared widgets
-// ---------------------------------------------------------
+// =========================================================================
+// Reusable UI Widget Builders
+// =========================================================================
 
+/// Creates a rounded bordered `Block` with a styled title and border color.
 fn panel<'a>(title: impl Into<Line<'a>>, color: Color) -> Block<'a> {
     Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1409,7 +1526,7 @@ fn panel<'a>(title: impl Into<Line<'a>>, color: Color) -> Block<'a> {
         .border_style(Style::new().fg(color))
 }
 
-/// A settings card; the active one gets a marker and the highlight colour.
+/// Creates a Settings field card, highlighting the border and prefixing `▶` when active.
 fn card(title: &str, active: bool, p: &Palette) -> Block<'static> {
     if active {
         panel(format!(" ▶ {title} "), p.highlight)
@@ -1418,10 +1535,12 @@ fn card(title: &str, active: bool, p: &Palette) -> Block<'static> {
     }
 }
 
+/// Shorthand for creating a colored `Span`.
 fn val<'a>(text: impl Into<Cow<'a, str>>, color: Color) -> Span<'a> {
     Span::styled(text, Style::new().fg(color))
 }
 
+/// Formats a bold fixed-width key label followed by a styled value `Span`.
 fn kv<'a>(label: &str, value: Span<'a>, p: &Palette) -> Line<'a> {
     let key = Span::styled(
         format!(" {label:<9}"),
@@ -1430,6 +1549,7 @@ fn kv<'a>(label: &str, value: Span<'a>, p: &Palette) -> Line<'a> {
     Line::from(vec![key, value])
 }
 
+/// Builds a Unicode progress `Gauge` bounded to `0..=100`.
 fn gauge(title: String, pct: u16, color: Color, p: &Palette) -> Gauge<'static> {
     Gauge::default()
         .block(panel(title, p.dim))
@@ -1438,6 +1558,7 @@ fn gauge(title: String, pct: u16, color: Color, p: &Palette) -> Gauge<'static> {
         .use_unicode(true)
 }
 
+/// Renders a selectable `List` for wizard steps (media type and output format).
 fn render_choices(
     f: &mut Frame,
     area: Rect,
@@ -1463,9 +1584,9 @@ fn render_choices(
     );
 }
 
-// ---------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------
+// =========================================================================
+// Panel Rendering Functions
+// =========================================================================
 
 fn ui(f: &mut Frame, app: &App) {
     let p = app.palette();
@@ -1494,6 +1615,7 @@ fn render_sidebar(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         Style::new().bg(p.surface).fg(p.text)
     };
 
+    // Decorate sidebar labels with live download progress, history count, or unsaved indicators.
     let items: Vec<String> = Menu::ALL
         .iter()
         .map(|&m| match m {
@@ -1542,7 +1664,7 @@ fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     ])
     .areas(inner);
 
-    // Identity card, two columns
+    // Two-column system identity card
     let card_block = panel(" System ", p.dim);
     let card_inner = card_block.inner(ident);
     f.render_widget(card_block, ident);
@@ -1571,7 +1693,7 @@ fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         right,
     );
 
-    // Gauges: CPU, Memory, Power
+    // Hardware resource gauges: CPU, Memory, Power
     let [cpu_area, mem_area, bat_area] = Layout::horizontal([
         Constraint::Percentage(33),
         Constraint::Percentage(34),
@@ -1618,7 +1740,7 @@ fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         ),
     }
 
-    // Environment & Tooling status
+    // Active configuration summary and external binary availability
     let row = |ok: bool, label: &'static str, value: Span<'static>| {
         let dot = if ok {
             val("● ", p.success)
@@ -1627,7 +1749,10 @@ fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         };
         Line::from(vec![
             dot,
-            Span::styled(format!("{label:<16}"), Style::new().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{label:<16}"),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
             value,
         ])
     };
@@ -1641,7 +1766,11 @@ fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     let cfg = &app.settings.cfg;
     f.render_widget(
         Paragraph::new(vec![
-            row(true, "Storage target", val(cfg.download_dir.clone(), p.highlight)),
+            row(
+                true,
+                "Storage target",
+                val(cfg.download_dir.clone(), p.highlight),
+            ),
             row(true, "Active theme", val(cfg.theme.name(), p.secondary)),
             row(
                 true,
@@ -1722,7 +1851,15 @@ fn render_downloader(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
                 head,
             );
             let items = formats.iter().map(|fmt| format!(" .{fmt}")).collect();
-            render_choices(f, list, "Container / Codec", items, dl.format_idx, p.success, p);
+            render_choices(
+                f,
+                list,
+                "Container / Codec",
+                items,
+                dl.format_idx,
+                p.success,
+                p,
+            );
         }
         Step::Running | Step::Done => {
             let (state, pct, speed, eta, lines) = {
@@ -1750,7 +1887,7 @@ fn render_downloader(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
             };
 
             let (headline, color) = match state {
-                JobState::Running => ("⏳ Downloading…", p.highlight),
+                JobState::Running => ("⟳ Downloading…", p.highlight),
                 JobState::Succeeded => ("✔ Download complete", p.success),
                 JobState::Failed => ("✖ Download failed", p.danger),
                 JobState::Cancelled => ("⊘ Download cancelled", p.dim),
@@ -1865,7 +2002,11 @@ fn render_analytics(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
             .highlight_style(highlight)
             .highlight_symbol(if focused { "▸" } else { " " });
         let selected = focused.then_some(app.history_idx);
-        f.render_stateful_widget(list, list_a, &mut ListState::default().with_selected(selected));
+        f.render_stateful_widget(
+            list,
+            list_a,
+            &mut ListState::default().with_selected(selected),
+        );
     }
 
     let foot_text = if focused && !app.history.is_empty() {
@@ -1886,7 +2027,8 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     let s = &app.settings;
     let active = |field: Field| focused && s.field() == field;
     let hint = |t: &'static str| val(t, p.dim);
-    let accent = |t: String| Span::styled(t, Style::new().fg(p.primary).add_modifier(Modifier::BOLD));
+    let accent =
+        |t: String| Span::styled(t, Style::new().fg(p.primary).add_modifier(Modifier::BOLD));
 
     let frame = panel(
         if focused {
@@ -1903,7 +2045,7 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         Layout::vertical([Length(3), Length(3), Length(3), Length(2), Min(1)]).areas(inner);
     let [subs_a, threads_a] = Layout::horizontal([Percentage(50), Percentage(50)]).areas(flags_a);
 
-    // Download directory
+    // Download directory path editor
     let max_path_chars = path_a.width.saturating_sub(30) as usize;
     let path_line = match &s.editing {
         Some(buf) => {
@@ -1926,7 +2068,7 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         path_a,
     );
 
-    // Theme
+    // Theme selector with position counter and 5-swatch preview bar
     let theme_idx = Theme::ALL.iter().position(|&t| t == s.cfg.theme).unwrap_or(0) + 1;
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1945,7 +2087,7 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         theme_a,
     );
 
-    // Subtitles
+    // Auto-subtitle toggle
     let subs = if s.cfg.embed_subtitles {
         val("● On", p.success)
     } else {
@@ -1957,7 +2099,7 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         subs_a,
     );
 
-    // Threads
+    // Concurrent fragment thread count
     f.render_widget(
         Paragraph::new(Line::from(vec![
             accent(format!("◂ {} ▸", s.cfg.concurrent_fragments)),
@@ -1967,7 +2109,7 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         threads_a,
     );
 
-    // Save button + status
+    // Save button and status message
     let button = if active(Field::Save) {
         Style::new()
             .bg(p.success)
@@ -2112,9 +2254,9 @@ fn render_update(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     );
 }
 
-// ---------------------------------------------------------
-// Tests
-// ---------------------------------------------------------
+// =========================================================================
+// Unit Tests
+// =========================================================================
 
 #[cfg(test)]
 mod tests {

@@ -8,6 +8,7 @@ ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+# Optimize release builds for small binary size and aggressive link-time inlining
 [profile.release]
 lto = true
 codegen-units = 1

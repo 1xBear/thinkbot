@@ -1,4 +1,14 @@
+# Example configuration for thinkbot
+# Copy to ~/.config/thinkbot/config.toml
+
+# Destination directory for downloaded media (supports ~ expansion)
 download_dir = "~/Downloads/"
+
+# Active color theme (see README.md for the full list of 18 supported themes)
 theme = "GruvboxDark"
+
+# Embed English auto-subtitles when downloading video containers
 embed_subtitles = false
+
+# Number of concurrent fragments passed to `yt-dlp -N` (clamped to 1..=16)
 concurrent_fragments = 4
