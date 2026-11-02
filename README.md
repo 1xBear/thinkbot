@@ -70,6 +70,7 @@ Settings are stored at `$XDG_CONFIG_HOME/thinkbot/config.toml` (defaults to `~/.
 ```toml
 download_dir = "~/Downloads"
 theme = "GruvboxDark"
+symbols = "Geometric"
 embed_subtitles = false
 concurrent_fragments = 4
 ```
@@ -77,3 +78,11 @@ concurrent_fragments = 4
 ### Available Themes
 
 `CatppuccinMocha`, `CatppuccinMacchiato`, `TokyoNight`, `Nord`, `GruvboxDark`, `Dracula`, `RosePine`, `Kanagawa`, `Everforest`, `OneDark`, `SolarizedDark`, `AyuMirage`, `Nightfox`, `MaterialOcean`, `HorizonDark`, `Monokai`, `Synthwave84`, `Cyberpunk`.
+
+### Available Button Symbol Presets
+
+- `Geometric` (`◈ ▼ ▲ ◆ ? ↻`)
+- `Arrows` (`» ↓ ↑ ≡ i ↺`)
+- `Technical` (`⠿ ⤓ ⧠ ⚙ ℹ ⥁`)
+- `Minimal` (`~ + % * ? @`)
+- `NerdFont` (Nerd Font glyphs for desktop, download, chart, cog, help, and refresh)

@@ -332,6 +332,162 @@ impl Theme {
 }
 
 // =========================================================================
+// Button & UI Symbol Presets
+// =========================================================================
+
+/// Complete set of symbols used for sidebar buttons, media choices, list cursors,
+/// settings steppers, and status indicators.
+#[derive(Clone, Copy)]
+struct Symbols {
+    /// Sidebar menu button labels `[Overview, Download, Analytics, Settings, Help, Update]`.
+    menu: [&'static str; 6],
+    /// Media kind button labels `[Video, Audio]`.
+    kind: [&'static str; 2],
+    /// Compact preview string shown inside the Settings selector card.
+    preview: &'static str,
+    /// Highlight symbol prefix for active `List` items (e.g. `"▸ "`).
+    list_cursor: &'static str,
+    /// Prefix marker for the active Settings card title (e.g. `"▶"`).
+    card_marker: &'static str,
+    /// Left and right stepper arrows for cycling values in Settings (`("◂", "▸")`).
+    stepper: (&'static str, &'static str),
+    /// Status icons: `(ok, err, cancel, running)`.
+    status: (&'static str, &'static str, &'static str, &'static str),
+    /// Boolean toggle badges: `(on, off)`.
+    toggle: (&'static str, &'static str),
+}
+
+/// Built-in button and icon symbol presets persisted in `config.toml`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum SymbolPreset {
+    #[default]
+    Geometric,
+    Arrows,
+    Technical,
+    Minimal,
+    NerdFont,
+}
+
+impl SymbolPreset {
+    /// Ordered list of all selectable symbol presets in the Settings panel.
+    const ALL: [SymbolPreset; 5] = [
+        SymbolPreset::Geometric,
+        SymbolPreset::Arrows,
+        SymbolPreset::Technical,
+        SymbolPreset::Minimal,
+        SymbolPreset::NerdFont,
+    ];
+
+    /// Human-readable display name shown in the Settings card.
+    const fn name(self) -> &'static str {
+        match self {
+            SymbolPreset::Geometric => "Geometric",
+            SymbolPreset::Arrows => "Chevron & Arrows",
+            SymbolPreset::Technical => "Technical Blocks",
+            SymbolPreset::Minimal => "Minimal ASCII",
+            SymbolPreset::NerdFont => "Nerd Font",
+        }
+    }
+
+    /// Steps forward or backward through `SymbolPreset::ALL`.
+    fn cycle(self, delta: i32) -> Self {
+        let i = Self::ALL.iter().position(|&s| s == self).unwrap_or(0);
+        Self::ALL[wrap(i, Self::ALL.len(), delta)]
+    }
+
+    /// Resolves the symbol table for this preset.
+    const fn symbols(self) -> Symbols {
+        match self {
+            SymbolPreset::Geometric => Symbols {
+                menu: [
+                    "◈ System Overview",
+                    "▼ Download Media",
+                    "▲ Analytics",
+                    "◆ Settings",
+                    "? Help",
+                    "↻ Update & Reboot",
+                ],
+                kind: ["▤ Video", "♪ Audio"],
+                preview: "◈ ▼ ▲ ◆ ? ↻",
+                list_cursor: "▸ ",
+                card_marker: "▶",
+                stepper: ("◂", "▸"),
+                status: ("✔", "✖", "⊘", "⟳"),
+                toggle: ("● On", "○ Off"),
+            },
+            SymbolPreset::Arrows => Symbols {
+                menu: [
+                    "» System Overview",
+                    "↓ Download Media",
+                    "↑ Analytics",
+                    "≡ Settings",
+                    "i Help",
+                    "↺ Update & Reboot",
+                ],
+                kind: ["▷ Video", "♫ Audio"],
+                preview: "» ↓ ↑ ≡ i ↺",
+                list_cursor: "» ",
+                card_marker: "»",
+                stepper: ("«", "»"),
+                status: ("✓", "✗", "⊗", "↻"),
+                toggle: ("◉ On", "◯ Off"),
+            },
+            SymbolPreset::Technical => Symbols {
+                menu: [
+                    "⠿ System Overview",
+                    "⤓ Download Media",
+                    "⧠ Analytics",
+                    "⚙ Settings",
+                    "ℹ Help",
+                    "⥁ Update & Reboot",
+                ],
+                kind: ["▣ Video", "♬ Audio"],
+                preview: "⠿ ⤓ ⧠ ⚙ ℹ ⥁",
+                list_cursor: "▍ ",
+                card_marker: "▍",
+                stepper: ("◁", "▷"),
+                status: ("✔", "✘", "⊘", "⧗"),
+                toggle: ("▣ On", "▢ Off"),
+            },
+            SymbolPreset::Minimal => Symbols {
+                menu: [
+                    "~ System Overview",
+                    "+ Download Media",
+                    "% Analytics",
+                    "* Settings",
+                    "? Help",
+                    "@ Update & Reboot",
+                ],
+                kind: ["# Video", "~ Audio"],
+                preview: "~ + % * ? @",
+                list_cursor: "> ",
+                card_marker: ">",
+                stepper: ("<", ">"),
+                status: ("+", "x", "-", "*"),
+                toggle: ("[*] On", "[ ] Off"),
+            },
+            SymbolPreset::NerdFont => Symbols {
+                menu: [
+                    "\u{f108} System Overview",
+                    "\u{f019} Download Media",
+                    "\u{f201} Analytics",
+                    "\u{f013} Settings",
+                    "\u{f059} Help",
+                    "\u{f021} Update & Reboot",
+                ],
+                kind: ["\u{f03d} Video", "\u{f001} Audio"],
+                preview: "\u{f108} \u{f019} \u{f201} \u{f013} \u{f059} \u{f021}",
+                list_cursor: "\u{f0da} ",
+                card_marker: "\u{f0da}",
+                stepper: ("\u{f0d9}", "\u{f0da}"),
+                status: ("\u{f00c}", "\u{f00d}", "\u{f05e}", "\u{f110}"),
+                toggle: ("\u{f111} On", "\u{f10c} Off"),
+            },
+        }
+    }
+}
+
+// =========================================================================
 // Configuration Persistence
 // =========================================================================
 
@@ -341,6 +497,7 @@ impl Theme {
 struct Config {
     download_dir: String,
     theme: Theme,
+    symbols: SymbolPreset,
     embed_subtitles: bool,
     concurrent_fragments: u8,
 }
@@ -350,6 +507,7 @@ impl Default for Config {
         Self {
             download_dir: home().map_or_else(|| "/tmp".into(), |h| format!("{h}/Downloads")),
             theme: Theme::GruvboxDark,
+            symbols: SymbolPreset::Geometric,
             embed_subtitles: false,
             concurrent_fragments: 4,
         }
@@ -412,15 +570,8 @@ impl Menu {
         Menu::Update,
     ];
 
-    const fn label(self) -> &'static str {
-        match self {
-            Menu::Overview => "◈ System Overview",
-            Menu::Download => "▼ Download Media",
-            Menu::Analytics => "▲ Analytics",
-            Menu::Settings => "◆ Settings",
-            Menu::Help => "? Help",
-            Menu::Update => "↻ Update & Reboot",
-        }
+    const fn label(self, sym: &Symbols) -> &'static str {
+        sym.menu[self as usize]
     }
 
     /// Returns `true` if pressing `Enter` moves keyboard focus into the right-hand panel.
@@ -451,11 +602,8 @@ enum Kind {
 impl Kind {
     const ALL: [Kind; 2] = [Kind::Video, Kind::Audio];
 
-    const fn label(self) -> &'static str {
-        match self {
-            Kind::Video => "▤ Video",
-            Kind::Audio => "♪ Audio",
-        }
+    const fn label(self, sym: &Symbols) -> &'static str {
+        sym.kind[self as usize]
     }
 
     /// Supported output container/codec extensions for each media type.
@@ -768,15 +916,17 @@ struct HistoryEntry {
 enum Field {
     Path,
     Theme,
+    Symbols,
     Subtitles,
     Threads,
     Save,
 }
 
 impl Field {
-    const ALL: [Field; 5] = [
+    const ALL: [Field; 6] = [
         Field::Path,
         Field::Theme,
+        Field::Symbols,
         Field::Subtitles,
         Field::Threads,
         Field::Save,
@@ -823,6 +973,7 @@ impl Settings {
     fn adjust(&mut self, delta: i32) {
         match self.field() {
             Field::Theme => self.cfg.theme = self.cfg.theme.cycle(delta),
+            Field::Symbols => self.cfg.symbols = self.cfg.symbols.cycle(delta),
             Field::Subtitles => self.cfg.embed_subtitles = !self.cfg.embed_subtitles,
             Field::Threads => {
                 self.cfg.concurrent_fragments =
@@ -834,13 +985,17 @@ impl Settings {
     }
 
     fn save(&mut self) {
+        let (ok_sym, err_sym, _, _) = self.cfg.symbols.symbols().status;
         match self.cfg.save() {
             Ok(()) => {
                 self.saved_cfg = self.cfg.clone();
-                self.status = Some((format!("✔ Saved to {}", Config::path().display()), true));
+                self.status = Some((
+                    format!("{ok_sym} Saved to {}", Config::path().display()),
+                    true,
+                ));
             }
             Err(e) => {
-                self.status = Some((format!("✖ Could not save config: {e}"), false));
+                self.status = Some((format!("{err_sym} Could not save config: {e}"), false));
             }
         }
     }
@@ -1108,6 +1263,10 @@ impl App {
 
     fn palette(&self) -> Palette {
         self.settings.cfg.theme.palette()
+    }
+
+    fn symbols(&self) -> Symbols {
+        self.settings.cfg.symbols.symbols()
     }
 
     fn selected(&self) -> Menu {
@@ -1526,10 +1685,11 @@ fn panel<'a>(title: impl Into<Line<'a>>, color: Color) -> Block<'a> {
         .border_style(Style::new().fg(color))
 }
 
-/// Creates a Settings field card, highlighting the border and prefixing `▶` when active.
-fn card(title: &str, active: bool, p: &Palette) -> Block<'static> {
+/// Creates a Settings field card, highlighting the border and prefixing the preset's
+/// active card marker when focused.
+fn card(title: &str, active: bool, sym: &Symbols, p: &Palette) -> Block<'static> {
     if active {
-        panel(format!(" ▶ {title} "), p.highlight)
+        panel(format!(" {} {title} ", sym.card_marker), p.highlight)
     } else {
         panel(format!(" {title} "), p.dim)
     }
@@ -1566,8 +1726,10 @@ fn render_choices(
     items: Vec<String>,
     selected: usize,
     accent: Color,
-    p: &Palette,
+    app: &App,
 ) {
+    let p = app.palette();
+    let sym = app.symbols();
     let list = List::new(items)
         .block(panel(format!(" {title} "), p.dim))
         .highlight_style(
@@ -1576,7 +1738,7 @@ fn render_choices(
                 .fg(ON_ACCENT)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▸ ");
+        .highlight_symbol(sym.list_cursor);
     f.render_stateful_widget(
         list,
         area,
@@ -1590,20 +1752,21 @@ fn render_choices(
 
 fn ui(f: &mut Frame, app: &App) {
     let p = app.palette();
+    let sym = app.symbols();
     let [side, main] =
         Layout::horizontal([Constraint::Length(28), Constraint::Min(40)]).areas(f.area());
-    render_sidebar(f, app, &p, side);
+    render_sidebar(f, app, &sym, &p, side);
     match app.selected() {
-        Menu::Overview => render_overview(f, app, &p, main),
-        Menu::Download => render_downloader(f, app, &p, main),
-        Menu::Analytics => render_analytics(f, app, &p, main),
-        Menu::Settings => render_settings(f, app, &p, main),
+        Menu::Overview => render_overview(f, app, &sym, &p, main),
+        Menu::Download => render_downloader(f, app, &sym, &p, main),
+        Menu::Analytics => render_analytics(f, app, &sym, &p, main),
+        Menu::Settings => render_settings(f, app, &sym, &p, main),
         Menu::Help => render_help(f, app, &p, main),
         Menu::Update => render_update(f, app, &p, main),
     }
 }
 
-fn render_sidebar(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
+fn render_sidebar(f: &mut Frame, app: &App, sym: &Symbols, p: &Palette, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
 
     let highlight = if focused {
@@ -1618,18 +1781,21 @@ fn render_sidebar(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     // Decorate sidebar labels with live download progress, history count, or unsaved indicators.
     let items: Vec<String> = Menu::ALL
         .iter()
-        .map(|&m| match m {
-            Menu::Download if app.dl.step == Step::Running => {
-                let pct = app.dl.job.lock().map_or(0, |j| j.percent as u16);
-                format!("{} [{pct}%]", m.label())
+        .map(|&m| {
+            let lbl = m.label(sym);
+            match m {
+                Menu::Download if app.dl.step == Step::Running => {
+                    let pct = app.dl.job.lock().map_or(0, |j| j.percent as u16);
+                    format!("{lbl} [{pct}%]")
+                }
+                Menu::Analytics if !app.history.is_empty() => {
+                    format!("{lbl} ({})", app.history.len())
+                }
+                Menu::Settings if app.settings.is_dirty() => {
+                    format!("{lbl} *")
+                }
+                _ => lbl.to_string(),
             }
-            Menu::Analytics if !app.history.is_empty() => {
-                format!("{} ({})", m.label(), app.history.len())
-            }
-            Menu::Settings if app.settings.is_dirty() => {
-                format!("{} *", m.label())
-            }
-            _ => m.label().to_string(),
         })
         .collect();
 
@@ -1640,7 +1806,7 @@ fn render_sidebar(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
                 .title_bottom(Line::styled(" q quit ", Style::new().fg(p.dim))),
         )
         .highlight_style(highlight)
-        .highlight_symbol("▸ ");
+        .highlight_symbol(sym.list_cursor);
 
     f.render_stateful_widget(
         list,
@@ -1649,9 +1815,10 @@ fn render_sidebar(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     );
 }
 
-fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
+fn render_overview(f: &mut Frame, app: &App, sym: &Symbols, p: &Palette, area: Rect) {
     let sys = &app.sys;
     let host = &app.host;
+    let (ok_sym, err_sym, _, _) = sym.status;
 
     let frame = panel(" Host Environment · r to refresh ", p.primary);
     let inner = frame.inner(area);
@@ -1660,7 +1827,7 @@ fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     let [ident, gauges, env] = Layout::vertical([
         Constraint::Length(6),
         Constraint::Length(3),
-        Constraint::Min(5),
+        Constraint::Min(6),
     ])
     .areas(inner);
 
@@ -1743,9 +1910,9 @@ fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     // Active configuration summary and external binary availability
     let row = |ok: bool, label: &'static str, value: Span<'static>| {
         let dot = if ok {
-            val("● ", p.success)
+            val(format!("{ok_sym} "), p.success)
         } else {
-            val("✖ ", p.danger)
+            val(format!("{err_sym} "), p.danger)
         };
         Line::from(vec![
             dot,
@@ -1772,6 +1939,7 @@ fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
                 val(cfg.download_dir.clone(), p.highlight),
             ),
             row(true, "Active theme", val(cfg.theme.name(), p.secondary)),
+            row(true, "Button symbols", val(cfg.symbols.name(), p.primary)),
             row(
                 true,
                 "Threads",
@@ -1785,7 +1953,7 @@ fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     );
 }
 
-fn render_downloader(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
+fn render_downloader(f: &mut Frame, app: &App, sym: &Symbols, p: &Palette, area: Rect) {
     use Constraint::{Length, Min};
 
     let focused = app.focus == Focus::Content;
@@ -1834,8 +2002,11 @@ fn render_downloader(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
                 ]),
                 head,
             );
-            let items = Kind::ALL.iter().map(|k| format!(" {}", k.label())).collect();
-            render_choices(f, list, "Media Type", items, dl.kind_idx, p.primary, p);
+            let items = Kind::ALL
+                .iter()
+                .map(|k| format!(" {}", k.label(sym)))
+                .collect();
+            render_choices(f, list, "Media Type", items, dl.kind_idx, p.primary, app);
         }
         Step::Format => {
             let formats = dl.formats();
@@ -1858,7 +2029,7 @@ fn render_downloader(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
                 items,
                 dl.format_idx,
                 p.success,
-                p,
+                app,
             );
         }
         Step::Running | Step::Done => {
@@ -1886,11 +2057,12 @@ fn render_downloader(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
                 )
             };
 
+            let (ok_sym, err_sym, cancel_sym, run_sym) = sym.status;
             let (headline, color) = match state {
-                JobState::Running => ("⟳ Downloading…", p.highlight),
-                JobState::Succeeded => ("✔ Download complete", p.success),
-                JobState::Failed => ("✖ Download failed", p.danger),
-                JobState::Cancelled => ("⊘ Download cancelled", p.dim),
+                JobState::Running => (format!("{run_sym} Downloading…"), p.highlight),
+                JobState::Succeeded => (format!("{ok_sym} Download complete"), p.success),
+                JobState::Failed => (format!("{err_sym} Download failed"), p.danger),
+                JobState::Cancelled => (format!("{cancel_sym} Download cancelled"), p.dim),
             };
 
             let bar_title = match (state, speed, eta) {
@@ -1925,10 +2097,11 @@ fn render_downloader(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     }
 }
 
-fn render_analytics(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
+fn render_analytics(f: &mut Frame, app: &App, sym: &Symbols, p: &Palette, area: Rect) {
     use Constraint::{Length, Min};
 
     let focused = app.focus == Focus::Content;
+    let (ok_sym, err_sym, cancel_sym, _) = sym.status;
     let title = if focused {
         " Session Analytics · Esc to return "
     } else {
@@ -1954,11 +2127,11 @@ fn render_analytics(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         Layout::vertical([Length(2), Min(1), Length(1)]).areas(inner);
 
     let summary = Line::from(vec![
-        val("✔ ", p.success),
+        val(format!("{ok_sym} "), p.success),
         Span::raw(format!("{ok} completed    ")),
-        val("✖ ", p.danger),
+        val(format!("{err_sym} "), p.danger),
         Span::raw(format!("{failed} failed    ")),
-        val("⊘ ", p.dim),
+        val(format!("{cancel_sym} "), p.dim),
         Span::raw(format!("{cancelled} cancelled")),
     ]);
     f.render_widget(Paragraph::new(summary), summary_a);
@@ -1976,9 +2149,9 @@ fn render_analytics(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
             .rev()
             .map(|h| {
                 let (icon, color) = match h.state {
-                    JobState::Succeeded => ("✔", p.success),
-                    JobState::Cancelled => ("⊘", p.dim),
-                    _ => ("✖", p.danger),
+                    JobState::Succeeded => (ok_sym, p.success),
+                    JobState::Cancelled => (cancel_sym, p.dim),
+                    _ => (err_sym, p.danger),
                 };
                 Line::from(vec![
                     val(format!(" {icon} "), color),
@@ -2000,7 +2173,7 @@ fn render_analytics(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
 
         let list = List::new(items)
             .highlight_style(highlight)
-            .highlight_symbol(if focused { "▸" } else { " " });
+            .highlight_symbol(if focused { sym.list_cursor } else { "  " });
         let selected = focused.then_some(app.history_idx);
         f.render_stateful_widget(
             list,
@@ -2020,7 +2193,7 @@ fn render_analytics(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     );
 }
 
-fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
+fn render_settings(f: &mut Frame, app: &App, sym: &Symbols, p: &Palette, area: Rect) {
     use Constraint::{Length, Min, Percentage};
 
     let focused = app.focus == Focus::Content;
@@ -2029,6 +2202,7 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     let hint = |t: &'static str| val(t, p.dim);
     let accent =
         |t: String| Span::styled(t, Style::new().fg(p.primary).add_modifier(Modifier::BOLD));
+    let (l_arr, r_arr) = sym.stepper;
 
     let frame = panel(
         if focused {
@@ -2041,8 +2215,9 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     let inner = frame.inner(area);
     f.render_widget(frame, area);
 
-    let [path_a, theme_a, flags_a, save_a, footer_a] =
-        Layout::vertical([Length(3), Length(3), Length(3), Length(2), Min(1)]).areas(inner);
+    let [path_a, theme_a, sym_a, flags_a, save_a, footer_a] =
+        Layout::vertical([Length(3), Length(3), Length(3), Length(3), Length(2), Min(1)])
+            .areas(inner);
     let [subs_a, threads_a] = Layout::horizontal([Percentage(50), Percentage(50)]).areas(flags_a);
 
     // Download directory path editor
@@ -2064,7 +2239,7 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
         ]),
     };
     f.render_widget(
-        Paragraph::new(path_line).block(card("Download directory", active(Field::Path), p)),
+        Paragraph::new(path_line).block(card("Download directory", active(Field::Path), sym, p)),
         path_a,
     );
 
@@ -2072,9 +2247,9 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     let theme_idx = Theme::ALL.iter().position(|&t| t == s.cfg.theme).unwrap_or(0) + 1;
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            accent("◂ ".into()),
+            accent(format!("{l_arr} ")),
             accent(s.cfg.theme.name().into()),
-            accent(" ▸ ".into()),
+            accent(format!(" {r_arr} ")),
             val(format!("({theme_idx}/{})  ", Theme::ALL.len()), p.dim),
             val("██", p.primary),
             val("██", p.secondary),
@@ -2083,29 +2258,49 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
             val("██", p.danger),
             hint("   h/l to switch"),
         ]))
-        .block(card("Colour scheme", active(Field::Theme), p)),
+        .block(card("Colour scheme", active(Field::Theme), sym, p)),
         theme_a,
     );
 
+    // Button symbols preset selector (right below Colour scheme)
+    let sym_idx = SymbolPreset::ALL
+        .iter()
+        .position(|&sp| sp == s.cfg.symbols)
+        .unwrap_or(0)
+        + 1;
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            accent(format!("{l_arr} ")),
+            accent(s.cfg.symbols.name().into()),
+            accent(format!(" {r_arr} ")),
+            val(format!("({sym_idx}/{})  ", SymbolPreset::ALL.len()), p.dim),
+            val(sym.preview, p.secondary),
+            hint("   h/l to switch"),
+        ]))
+        .block(card("Button symbols", active(Field::Symbols), sym, p)),
+        sym_a,
+    );
+
     // Auto-subtitle toggle
+    let (on_lbl, off_lbl) = sym.toggle;
     let subs = if s.cfg.embed_subtitles {
-        val("● On", p.success)
+        val(on_lbl, p.success)
     } else {
-        val("○ Off", p.dim)
+        val(off_lbl, p.dim)
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![subs, hint("   embeds EN subs (video)")]))
-            .block(card("Auto subtitles", active(Field::Subtitles), p)),
+            .block(card("Auto subtitles", active(Field::Subtitles), sym, p)),
         subs_a,
     );
 
     // Concurrent fragment thread count
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            accent(format!("◂ {} ▸", s.cfg.concurrent_fragments)),
+            accent(format!("{l_arr} {} {r_arr}", s.cfg.concurrent_fragments)),
             hint("   h/l to adjust"),
         ]))
-        .block(card("Download threads", active(Field::Threads), p)),
+        .block(card("Download threads", active(Field::Threads), sym, p)),
         threads_a,
     );
 
@@ -2125,7 +2320,7 @@ fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
                 .fg(if *ok { p.success } else { p.danger })
                 .add_modifier(Modifier::BOLD),
         ),
-        (None, true) => val("● Unsaved changes (Enter or Ctrl+S to save)", p.highlight),
+        (None, true) => val("* Unsaved changes (Enter or Ctrl+S to save)", p.highlight),
         (None, false) => hint("Enter or Ctrl+S to write config to disk"),
     };
     let save_label = if s.is_dirty() {
@@ -2314,10 +2509,15 @@ mod tests {
     }
 
     #[test]
-    fn theme_cycle_wraps_around() {
-        let first = Theme::ALL[0];
-        let last = Theme::ALL[Theme::ALL.len() - 1];
-        assert_eq!(first.cycle(-1), last);
-        assert_eq!(last.cycle(1), first);
+    fn theme_and_symbol_preset_cycle_wrap_around() {
+        let first_t = Theme::ALL[0];
+        let last_t = Theme::ALL[Theme::ALL.len() - 1];
+        assert_eq!(first_t.cycle(-1), last_t);
+        assert_eq!(last_t.cycle(1), first_t);
+
+        let first_s = SymbolPreset::ALL[0];
+        let last_s = SymbolPreset::ALL[SymbolPreset::ALL.len() - 1];
+        assert_eq!(first_s.cycle(-1), last_s);
+        assert_eq!(last_s.cycle(1), first_s);
     }
 }

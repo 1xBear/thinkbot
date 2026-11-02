@@ -7,6 +7,9 @@ download_dir = "~/Downloads/"
 # Active color theme (see README.md for the full list of 18 supported themes)
 theme = "GruvboxDark"
 
+# Button and UI symbol preset: "Geometric", "Arrows", "Technical", "Minimal", or "NerdFont"
+symbols = "Geometric"
+
 # Embed English auto-subtitles when downloading video containers
 embed_subtitles = false
 
