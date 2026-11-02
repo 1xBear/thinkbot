@@ -11,19 +11,25 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     env, fs,
     io::{self, BufRead, BufReader, Read},
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-const TICK: Duration = Duration::from_millis(100);
+const ACTIVE_TICK: Duration = Duration::from_millis(80);
+const IDLE_TICK: Duration = Duration::from_millis(500);
 const SYSTEM_REFRESH: Duration = Duration::from_secs(2);
 const MAX_LOG_LINES: usize = 200;
-const ON_ACCENT: Color = Color::Black;
+const ON_ACCENT: Color = hex(0x11111b);
 
 // ---------------------------------------------------------
 // Small helpers
@@ -31,6 +37,9 @@ const ON_ACCENT: Color = Color::Black;
 
 /// Wrap `idx + delta` into `0..len`.
 fn wrap(idx: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
     (idx as i32 + delta).rem_euclid(len as i32) as usize
 }
 
@@ -39,19 +48,40 @@ fn home() -> Option<String> {
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), home()) {
+    let trimmed = path.trim();
+    if trimmed == "~" {
+        if let Some(h) = home() {
+            return PathBuf::from(h);
+        }
+    }
+    match (trimmed.strip_prefix("~/"), home()) {
         (Some(rest), Some(h)) => PathBuf::from(h).join(rest),
-        _ => PathBuf::from(path),
+        _ => PathBuf::from(trimmed),
     }
 }
 
-fn read(path: impl AsRef<Path>) -> Option<String> {
+fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
+/// Check if an executable exists in `$PATH`.
+fn has_command(bin: &str) -> bool {
+    env::var_os("PATH").is_some_and(|paths| {
+        env::split_paths(&paths).any(|dir| {
+            let full = dir.join(bin);
+            full.is_file()
+        })
+    })
+}
+
 /// Last `n` characters of `s` (keeps the text cursor visible in narrow inputs).
-fn tail_chars(s: &str, n: usize) -> String {
-    s.chars().skip(s.chars().count().saturating_sub(n)).collect()
+fn tail_chars(s: &str, n: usize) -> &str {
+    let total = s.chars().count();
+    let skip = total.saturating_sub(n);
+    match s.char_indices().nth(skip) {
+        Some((byte_idx, _)) => &s[byte_idx..],
+        None => "",
+    }
 }
 
 fn vertical(code: KeyCode) -> Option<i32> {
@@ -66,12 +96,30 @@ fn is_back(code: KeyCode) -> bool {
     matches!(code, KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h'))
 }
 
+/// Delete the last word/segment from `buf` (Ctrl+W behavior).
+fn pop_word(buf: &mut String) {
+    let trimmed_len = buf.trim_end().len();
+    buf.truncate(trimmed_len);
+    if let Some(idx) = buf.rfind(|c: char| c.is_whitespace() || c == '/' || c == '&' || c == '?') {
+        if idx + 1 == buf.len() {
+            buf.pop();
+        } else {
+            buf.truncate(idx + 1);
+        }
+    } else {
+        buf.clear();
+    }
+}
+
 /// Apply a key to a text buffer. Returns true if the key was consumed.
 fn edit_text(buf: &mut String, key: KeyEvent) -> bool {
-    match (key.code, key.modifiers.contains(KeyModifiers::CONTROL)) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match (key.code, ctrl) {
         (KeyCode::Char('u'), true) => buf.clear(),
-        (KeyCode::Char(c), false) => buf.push(c),
-        (KeyCode::Backspace, _) => {
+        (KeyCode::Char('w') | KeyCode::Char('h'), true) => pop_word(buf),
+        (KeyCode::Char(c), false) if !c.is_control() => buf.push(c),
+        (KeyCode::Backspace, true) => pop_word(buf),
+        (KeyCode::Backspace, false) => {
             buf.pop();
         }
         _ => return false,
@@ -99,34 +147,70 @@ struct Palette {
     danger: Color,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Theme {
     CatppuccinMocha,
+    CatppuccinMacchiato,
     TokyoNight,
     Nord,
-    Monokai,
-    Cyberpunk,
     GruvboxDark,
+    Dracula,
+    RosePine,
+    Kanagawa,
+    Everforest,
+    OneDark,
+    SolarizedDark,
+    AyuMirage,
+    Nightfox,
+    MaterialOcean,
+    HorizonDark,
+    Monokai,
+    Synthwave84,
+    Cyberpunk,
 }
 
 impl Theme {
-    const ALL: [Theme; 6] = [
+    const ALL: [Theme; 18] = [
         Theme::CatppuccinMocha,
+        Theme::CatppuccinMacchiato,
         Theme::TokyoNight,
         Theme::Nord,
-        Theme::Monokai,
-        Theme::Cyberpunk,
         Theme::GruvboxDark,
+        Theme::Dracula,
+        Theme::RosePine,
+        Theme::Kanagawa,
+        Theme::Everforest,
+        Theme::OneDark,
+        Theme::SolarizedDark,
+        Theme::AyuMirage,
+        Theme::Nightfox,
+        Theme::MaterialOcean,
+        Theme::HorizonDark,
+        Theme::Monokai,
+        Theme::Synthwave84,
+        Theme::Cyberpunk,
     ];
 
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Theme::CatppuccinMocha => "Catppuccin Mocha",
+            Theme::CatppuccinMacchiato => "Catppuccin Macchiato",
             Theme::TokyoNight => "Tokyo Night",
             Theme::Nord => "Nord Ice",
-            Theme::Monokai => "Monokai Pro",
-            Theme::Cyberpunk => "Cyberpunk Neon",
             Theme::GruvboxDark => "Gruvbox Dark",
+            Theme::Dracula => "Dracula",
+            Theme::RosePine => "Rosé Pine",
+            Theme::Kanagawa => "Kanagawa Wave",
+            Theme::Everforest => "Everforest Dark",
+            Theme::OneDark => "One Dark Pro",
+            Theme::SolarizedDark => "Solarized Dark",
+            Theme::AyuMirage => "Ayu Mirage",
+            Theme::Nightfox => "Nightfox",
+            Theme::MaterialOcean => "Material Ocean",
+            Theme::HorizonDark => "Horizon Dark",
+            Theme::Monokai => "Monokai Pro",
+            Theme::Synthwave84 => "Synthwave '84",
+            Theme::Cyberpunk => "Cyberpunk Neon",
         }
     }
 
@@ -135,15 +219,63 @@ impl Theme {
         Self::ALL[wrap(i, Self::ALL.len(), delta)]
     }
 
-    fn palette(self) -> Palette {
+    const fn palette(self) -> Palette {
         // primary, secondary, highlight, text, dim, surface, success, danger
         let c = match self {
-            Theme::CatppuccinMocha => [0x89b4fa, 0xcba6f7, 0xb4befe, 0xcdd6f4, 0x585b70, 0x313244, 0xa6e3a1, 0xf38ba8],
-            Theme::TokyoNight => [0x7aa2f7, 0xbb9af7, 0xe0af68, 0xc0caf5, 0x414868, 0x24283b, 0x9ece6a, 0xf7768e],
-            Theme::Nord => [0x88c0d0, 0x81a1c1, 0xebcb8b, 0xeceff4, 0x4c566a, 0x3b4252, 0xa3be8c, 0xbf616a],
-            Theme::Monokai => [0x66d9ef, 0xf92672, 0xe6db74, 0xf8f8f2, 0x75715e, 0x3e3d32, 0xa6e22e, 0xf92672],
-            Theme::Cyberpunk => [0x00ffea, 0xff007f, 0xfee715, 0xffffff, 0x505064, 0x1a1a2e, 0x39ff14, 0xff3131],
-            Theme::GruvboxDark => [0xfe8019, 0xb8bb26, 0xfabd2f, 0xebdbb2, 0x665c54, 0x3c3836, 0xb8bb26, 0xfb4934],
+            Theme::CatppuccinMocha => [
+                0x89b4fa, 0xcba6f7, 0xf9e2af, 0xcdd6f4, 0x6c7086, 0x313244, 0xa6e3a1, 0xf38ba8,
+            ],
+            Theme::CatppuccinMacchiato => [
+                0x8aadf4, 0xc6a0f6, 0xeed49f, 0xcad3f5, 0x6e738d, 0x363a4f, 0xa6da95, 0xed8796,
+            ],
+            Theme::TokyoNight => [
+                0x7aa2f7, 0xbb9af7, 0xe0af68, 0xc0caf5, 0x565f89, 0x24283b, 0x9ece6a, 0xf7768e,
+            ],
+            Theme::Nord => [
+                0x88c0d0, 0xb48ead, 0xebcb8b, 0xeceff4, 0x616e88, 0x3b4252, 0xa3be8c, 0xbf616a,
+            ],
+            Theme::GruvboxDark => [
+                0xfe8019, 0xd3869b, 0xfabd2f, 0xebdbb2, 0x7c6f64, 0x3c3836, 0xb8bb26, 0xfb4934,
+            ],
+            Theme::Dracula => [
+                0xbd93f9, 0xff79c6, 0xf1fa8c, 0xf8f8f2, 0x6272a4, 0x44475a, 0x50fa7b, 0xff5555,
+            ],
+            Theme::RosePine => [
+                0xebbcba, 0xc4a7e7, 0xf6c177, 0xe0def4, 0x6e6a86, 0x26233a, 0x9ccfd8, 0xeb6f92,
+            ],
+            Theme::Kanagawa => [
+                0x7e9cd8, 0x957fb8, 0xe6c384, 0xdcd7ba, 0x727169, 0x2a2a37, 0x98bb6c, 0xe46876,
+            ],
+            Theme::Everforest => [
+                0x7fbbb3, 0xd699b6, 0xdbbc7f, 0xd3c6aa, 0x859289, 0x343f44, 0xa7c080, 0xe67e80,
+            ],
+            Theme::OneDark => [
+                0x61afef, 0xc678dd, 0xe5c07b, 0xabb2bf, 0x5c6370, 0x2c323c, 0x98c379, 0xe06c75,
+            ],
+            Theme::SolarizedDark => [
+                0x268bd2, 0x6c71c4, 0xb58900, 0x93a1a1, 0x586e75, 0x073642, 0x859900, 0xdc322f,
+            ],
+            Theme::AyuMirage => [
+                0x73d0ff, 0xd4bfff, 0xffcc66, 0xcccac2, 0x5c6773, 0x242936, 0xbae67e, 0xf28779,
+            ],
+            Theme::Nightfox => [
+                0x719cd6, 0x9d79d6, 0xdbc074, 0xcdcecf, 0x738091, 0x29394f, 0x81b29a, 0xc94f6d,
+            ],
+            Theme::MaterialOcean => [
+                0x82aaff, 0xc792ea, 0xffcb6b, 0xeeffff, 0x546e7a, 0x263238, 0xc3e88d, 0xf07178,
+            ],
+            Theme::HorizonDark => [
+                0xe95678, 0xb877db, 0xfab795, 0xd5d8da, 0x6c6f93, 0x2e303e, 0x27d797, 0xf43e5c,
+            ],
+            Theme::Monokai => [
+                0x66d9ef, 0xab9df2, 0xe6db74, 0xf8f8f2, 0x75715e, 0x3e3d32, 0xa6e22e, 0xff6188,
+            ],
+            Theme::Synthwave84 => [
+                0x36f9f6, 0xff7edb, 0xfede5d, 0xffffff, 0x848bbd, 0x2a2139, 0x72f1b8, 0xfe4450,
+            ],
+            Theme::Cyberpunk => [
+                0x00ffea, 0xff007f, 0xfee715, 0xffffff, 0x5c5c78, 0x1a1a2e, 0x39ff14, 0xff3131,
+            ],
         };
         Palette {
             primary: hex(c[0]),
@@ -162,7 +294,7 @@ impl Theme {
 // Config
 // ---------------------------------------------------------
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(default)]
 struct Config {
     download_dir: String,
@@ -191,7 +323,7 @@ impl Config {
     }
 
     fn load() -> Self {
-        let mut cfg: Self = read(Self::path())
+        let mut cfg: Self = read_trimmed(Self::path())
             .and_then(|s| toml::from_str(&s).ok())
             .unwrap_or_default();
         cfg.concurrent_fragments = cfg.concurrent_fragments.clamp(1, 16);
@@ -219,24 +351,33 @@ enum Menu {
     Analytics,
     Settings,
     Help,
+    Update,
 }
 
 impl Menu {
-    const ALL: [Menu; 5] = [Menu::Overview, Menu::Download, Menu::Analytics, Menu::Settings, Menu::Help];
+    const ALL: [Menu; 6] = [
+        Menu::Overview,
+        Menu::Download,
+        Menu::Analytics,
+        Menu::Settings,
+        Menu::Help,
+        Menu::Update,
+    ];
 
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Menu::Overview => "◈ System Overview",
             Menu::Download => "▼ Download Media",
             Menu::Analytics => "▲ Analytics",
             Menu::Settings => "◆ Settings",
             Menu::Help => "? Help",
+            Menu::Update => "↻ Update & Reboot",
         }
     }
 
-    /// Overview and Help are static; everything else takes keyboard focus.
-    fn is_enterable(self) -> bool {
-        !matches!(self, Menu::Overview | Menu::Help)
+    /// Overview, Help, and Update do not take inner content focus (Update triggers immediately on Enter).
+    const fn is_enterable(self) -> bool {
+        !matches!(self, Menu::Overview | Menu::Help | Menu::Update)
     }
 }
 
@@ -259,14 +400,14 @@ enum Kind {
 impl Kind {
     const ALL: [Kind; 2] = [Kind::Video, Kind::Audio];
 
-    fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Kind::Video => "▤ Video",
             Kind::Audio => "♪ Audio",
         }
     }
 
-    fn formats(self) -> &'static [&'static str] {
+    const fn formats(self) -> &'static [&'static str] {
         match self {
             Kind::Video => &["mp4", "mkv", "webm", "mov"],
             Kind::Audio => &["mp3", "m4a", "flac", "wav", "opus"],
@@ -283,20 +424,36 @@ enum Step {
     Done,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum JobState {
     #[default]
     Running,
     Succeeded,
     Failed,
+    Cancelled,
 }
 
 /// Output of a running yt-dlp process, shared with the UI thread.
-#[derive(Default)]
 struct Job {
-    lines: Vec<String>,
+    lines: VecDeque<String>,
     percent: f64,
+    speed: Option<String>,
+    eta: Option<String>,
     state: JobState,
+    version: u64,
+}
+
+impl Default for Job {
+    fn default() -> Self {
+        Self {
+            lines: VecDeque::with_capacity(MAX_LOG_LINES),
+            percent: 0.0,
+            speed: None,
+            eta: None,
+            state: JobState::Running,
+            version: 0,
+        }
+    }
 }
 
 fn is_progress(line: &str) -> bool {
@@ -310,21 +467,43 @@ impl Job {
             return;
         }
         if is_progress(line) {
-            if let Some(pct) = line.split('%').next().and_then(|s| s.rsplit(char::is_whitespace).next()) {
+            if let Some(pct) = line
+                .split('%')
+                .next()
+                .and_then(|s| s.rsplit(char::is_whitespace).next())
+            {
                 self.percent = pct.parse().unwrap_or(self.percent);
             }
+            // Extract speed ("at 5.20MiB/s") and ETA ("ETA 00:12") if present.
+            if let Some(after_at) = line.split(" at ").nth(1) {
+                let mut parts = after_at.split_whitespace();
+                if let Some(spd) = parts.next() {
+                    if spd != "Unknown" {
+                        self.speed = Some(spd.to_string());
+                    }
+                }
+            }
+            if let Some(after_eta) = line.split("ETA ").nth(1) {
+                if let Some(eta) = after_eta.split_whitespace().next() {
+                    if eta != "Unknown" {
+                        self.eta = Some(eta.to_string());
+                    }
+                }
+            }
             // Collapse consecutive progress lines into one.
-            if self.lines.last().is_some_and(|l| is_progress(l)) {
-                self.lines.pop();
+            if self.lines.back().is_some_and(|l| is_progress(l)) {
+                self.lines.pop_back();
             }
         }
-        self.lines.push(line.to_string());
-        if self.lines.len() > MAX_LOG_LINES {
-            self.lines.remove(0);
+        if self.lines.len() >= MAX_LOG_LINES {
+            self.lines.pop_front();
         }
+        self.lines.push_back(line.to_string());
+        self.version = self.version.wrapping_add(1);
     }
 }
 
+#[derive(Clone)]
 struct Request {
     url: String,
     kind: Kind,
@@ -337,21 +516,36 @@ struct Request {
 fn pump(reader: impl Read + Send + 'static, job: Arc<Mutex<Job>>) -> JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
-            job.lock().unwrap().push(&line);
+            if let Ok(mut j) = job.lock() {
+                j.push(&line);
+            }
         }
     })
 }
 
-fn spawn_download(req: Request) -> Arc<Mutex<Job>> {
+fn spawn_download(req: Request) -> (Arc<Mutex<Job>>, Arc<AtomicBool>) {
     let job = Arc::new(Mutex::new(Job::default()));
-    let shared = Arc::clone(&job);
-    thread::spawn(move || run_download(req, shared));
-    job
+    let cancel = Arc::new(AtomicBool::new(false));
+    let shared_job = Arc::clone(&job);
+    let shared_cancel = Arc::clone(&cancel);
+    thread::spawn(move || run_download(req, shared_job, shared_cancel));
+    (job, cancel)
 }
 
-fn run_download(req: Request, job: Arc<Mutex<Job>>) {
+fn run_download(req: Request, job: Arc<Mutex<Job>>, cancel: Arc<AtomicBool>) {
+    if let Err(e) = fs::create_dir_all(&req.dir) {
+        if let Ok(mut j) = job.lock() {
+            j.push(&format!("Failed to create output directory {}: {e}", req.dir.display()));
+            j.state = JobState::Failed;
+        }
+        return;
+    }
+
     let mut cmd = Command::new("yt-dlp");
-    cmd.args(["--newline", "-N"]).arg(req.threads.to_string()).arg("-P").arg(&req.dir);
+    cmd.args(["--newline", "-N"])
+        .arg(req.threads.to_string())
+        .arg("-P")
+        .arg(&req.dir);
 
     match req.kind {
         Kind::Audio => cmd.args(["-x", "--audio-format", req.format]),
@@ -370,15 +564,18 @@ fn run_download(req: Request, job: Arc<Mutex<Job>>) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    job.lock().unwrap().push(&format!("Saving to {}", req.dir.display()));
+    if let Ok(mut j) = job.lock() {
+        j.push(&format!("Saving to {}", req.dir.display()));
+    }
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let mut j = job.lock().unwrap();
-            j.push(&format!("Failed to launch yt-dlp: {e}"));
-            j.push("Make sure yt-dlp is installed and on your PATH.");
-            j.state = JobState::Failed;
+            if let Ok(mut j) = job.lock() {
+                j.push(&format!("Failed to launch yt-dlp: {e}"));
+                j.push("Make sure yt-dlp is installed and on your PATH.");
+                j.state = JobState::Failed;
+            }
             return;
         }
     };
@@ -387,24 +584,47 @@ fn run_download(req: Request, job: Arc<Mutex<Job>>) {
         child.stdout.take().map(|o| pump(o, Arc::clone(&job))),
         child.stderr.take().map(|e| pump(e, Arc::clone(&job))),
     ];
-    let status = child.wait();
+
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            for handle in readers.into_iter().flatten() {
+                let _ = handle.join();
+            }
+            if let Ok(mut j) = job.lock() {
+                j.push("Download cancelled by user.");
+                j.state = JobState::Cancelled;
+            }
+            return;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(e) => break Err(e),
+        }
+    };
+
     for handle in readers.into_iter().flatten() {
         let _ = handle.join();
     }
 
-    let mut j = job.lock().unwrap();
-    match status {
-        Ok(s) if s.success() => {
-            j.percent = 100.0;
-            j.state = JobState::Succeeded;
-        }
-        Ok(s) => {
-            j.push(&format!("yt-dlp exited with {s}"));
-            j.state = JobState::Failed;
-        }
-        Err(e) => {
-            j.push(&format!("Could not wait for yt-dlp: {e}"));
-            j.state = JobState::Failed;
+    if let Ok(mut j) = job.lock() {
+        match status {
+            Ok(s) if s.success() => {
+                j.percent = 100.0;
+                j.eta = None;
+                j.state = JobState::Succeeded;
+                j.version = j.version.wrapping_add(1);
+            }
+            Ok(s) => {
+                j.push(&format!("yt-dlp exited with {s}"));
+                j.state = JobState::Failed;
+            }
+            Err(e) => {
+                j.push(&format!("Could not wait for yt-dlp: {e}"));
+                j.state = JobState::Failed;
+            }
         }
     }
 }
@@ -415,6 +635,9 @@ struct Downloader {
     kind_idx: usize,
     format_idx: usize,
     job: Arc<Mutex<Job>>,
+    cancel: Arc<AtomicBool>,
+    last_seen_version: u64,
+    started_at: Option<Instant>,
 }
 
 impl Downloader {
@@ -425,6 +648,9 @@ impl Downloader {
             kind_idx: 0,
             format_idx: 0,
             job: Arc::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            last_seen_version: 0,
+            started_at: None,
         }
     }
 
@@ -439,12 +665,20 @@ impl Downloader {
     fn format(&self) -> &'static str {
         self.formats()[self.format_idx]
     }
+
+    fn cancel_running(&self) {
+        if self.step == Step::Running {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 struct HistoryEntry {
     url: String,
+    kind: Kind,
     format: &'static str,
-    ok: bool,
+    state: JobState,
+    elapsed_secs: u64,
 }
 
 // ---------------------------------------------------------
@@ -461,11 +695,18 @@ enum Field {
 }
 
 impl Field {
-    const ALL: [Field; 5] = [Field::Path, Field::Theme, Field::Subtitles, Field::Threads, Field::Save];
+    const ALL: [Field; 5] = [
+        Field::Path,
+        Field::Theme,
+        Field::Subtitles,
+        Field::Threads,
+        Field::Save,
+    ];
 }
 
 struct Settings {
     cfg: Config,
+    saved_cfg: Config,
     field: usize,
     /// `Some(buffer)` while the download path is being edited.
     editing: Option<String>,
@@ -474,7 +715,18 @@ struct Settings {
 
 impl Settings {
     fn new() -> Self {
-        Self { cfg: Config::load(), field: 0, editing: None, status: None }
+        let cfg = Config::load();
+        Self {
+            saved_cfg: cfg.clone(),
+            cfg,
+            field: 0,
+            editing: None,
+            status: None,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.cfg != self.saved_cfg
     }
 
     fn field(&self) -> Field {
@@ -500,116 +752,203 @@ impl Settings {
     }
 
     fn save(&mut self) {
-        self.status = Some(match self.cfg.save() {
-            Ok(()) => (format!("✔ Saved to {}", Config::path().display()), true),
-            Err(e) => (format!("✖ Could not save config: {e}"), false),
-        });
+        match self.cfg.save() {
+            Ok(()) => {
+                self.saved_cfg = self.cfg.clone();
+                self.status = Some((format!("✔ Saved to {}", Config::path().display()), true));
+            }
+            Err(e) => {
+                self.status = Some((format!("✖ Could not save config: {e}"), false));
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------
-// Host metrics
+// Host metrics (cached static info + polled dynamic telemetry)
 // ---------------------------------------------------------
 
-struct SystemSnapshot {
+/// Static host attributes resolved once at startup.
+struct StaticHostInfo {
     os: String,
     host: String,
     kernel: String,
-    uptime: String,
     root_fs: String,
     desktop: String,
-    load: String,
-    mem_used_mib: u64,
-    mem_total_mib: u64,
-    battery: Option<(u16, String)>,
-    temp_c: Option<u16>,
+    battery_dir: Option<PathBuf>,
+    thermal_zone: Option<PathBuf>,
+    has_ytdlp: bool,
+    has_ffmpeg: bool,
 }
 
-fn battery() -> Option<(u16, String)> {
-    let dir = fs::read_dir("/sys/class/power_supply")
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("BAT")))?;
-    let pct = read(dir.join("capacity"))?.parse().ok()?;
-    let status = read(dir.join("status")).unwrap_or_else(|| "Unknown".into());
-    Some((pct, status))
-}
-
-fn cpu_temp() -> Option<u16> {
-    let mut zones: Vec<PathBuf> = fs::read_dir("/sys/class/thermal")
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("thermal_zone")))
-        .collect();
-    zones.sort();
-    let zone = zones
-        .iter()
-        .find(|z| read(z.join("type")).as_deref() == Some("x86_pkg_temp"))
-        .or(zones.first())?;
-    let millideg: u32 = read(zone.join("temp"))?.parse().ok()?;
-    Some((millideg / 1000) as u16)
-}
-
-fn format_uptime(secs: u64) -> String {
-    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
-    if d > 0 { format!("{d}d {h}h {m}m") } else { format!("{h}h {m}m") }
-}
-
-impl SystemSnapshot {
-    fn poll() -> Self {
-        let os = read("/etc/os-release")
+impl StaticHostInfo {
+    fn detect() -> Self {
+        let os_name = read_trimmed("/etc/os-release")
             .and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.strip_prefix("PRETTY_NAME=").map(|v| v.trim_matches('"').to_string()))
+                s.lines().find_map(|l| {
+                    l.strip_prefix("PRETTY_NAME=")
+                        .map(|v| v.trim_matches('"').to_string())
+                })
             })
             .unwrap_or_else(|| "Linux".into());
 
-        let uptime_secs = read("/proc/uptime")
-            .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
-            .unwrap_or(0.0) as u64;
-
-        let root_fs = read("/proc/mounts")
+        let root_fs = read_trimmed("/proc/mounts")
             .and_then(|s| {
                 s.lines()
                     .filter_map(|l| {
                         let mut f = l.split_whitespace().skip(1);
                         (f.next()? == "/").then(|| f.next().unwrap_or("?").to_string())
                     })
-                    .last()
+                    .next_back()
             })
             .unwrap_or_else(|| "unknown".into());
 
-        let meminfo = read("/proc/meminfo").unwrap_or_default();
-        let kib = |key: &str| -> u64 {
-            meminfo
-                .lines()
-                .find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse().ok())
-                .unwrap_or(0)
-        };
-        let (total, avail) = (kib("MemTotal:"), kib("MemAvailable:"));
-
         let desktop = match (env::var("XDG_CURRENT_DESKTOP"), env::var("XDG_SESSION_TYPE")) {
-            (Ok(d), Ok(s)) => format!("{d} ({s})"),
-            (Ok(d), Err(_)) => d,
+            (Ok(d), Ok(s)) if !d.is_empty() => format!("{d} ({s})"),
+            (Ok(d), _) if !d.is_empty() => d,
             _ => "unknown".into(),
         };
 
+        let battery_dir = fs::read_dir("/sys/class/power_supply")
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("BAT")))
+            });
+
+        let thermal_zone = fs::read_dir("/sys/class/thermal").ok().and_then(|entries| {
+            let mut zones: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("thermal_zone"))
+                })
+                .collect();
+            zones.sort();
+            zones
+                .iter()
+                .find(|z| read_trimmed(z.join("type")).as_deref() == Some("x86_pkg_temp"))
+                .or_else(|| zones.first())
+                .cloned()
+        });
+
         Self {
-            os: format!("{os} {}", env::consts::ARCH),
-            host: read("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into()),
-            kernel: read("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".into()),
-            uptime: format_uptime(uptime_secs),
+            os: format!("{os_name} {}", env::consts::ARCH),
+            host: read_trimmed("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into()),
+            kernel: read_trimmed("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".into()),
             root_fs,
             desktop,
-            load: read("/proc/loadavg")
+            battery_dir,
+            thermal_zone,
+            has_ytdlp: has_command("yt-dlp"),
+            has_ffmpeg: has_command("ffmpeg"),
+        }
+    }
+
+    fn refresh_tools(&mut self) {
+        self.has_ytdlp = has_command("yt-dlp");
+        self.has_ffmpeg = has_command("ffmpeg");
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct CpuSample {
+    total: u64,
+    idle: u64,
+}
+
+fn read_cpu_sample() -> Option<CpuSample> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    let line = stat.lines().next()?;
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "cpu" {
+        return None;
+    }
+    let vals: Vec<u64> = parts.filter_map(|p| p.parse().ok()).collect();
+    if vals.len() < 4 {
+        return None;
+    }
+    let total: u64 = vals.iter().sum();
+    let idle = vals[3] + vals.get(4).copied().unwrap_or(0); // idle + iowait
+    Some(CpuSample { total, idle })
+}
+
+struct SystemSnapshot {
+    uptime: String,
+    load: String,
+    cpu_pct: u16,
+    prev_cpu: Option<CpuSample>,
+    mem_used_mib: u64,
+    mem_total_mib: u64,
+    battery: Option<(u16, String)>,
+    temp_c: Option<u16>,
+}
+
+fn format_uptime(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h {m}m")
+    } else {
+        format!("{h}h {m}m")
+    }
+}
+
+impl SystemSnapshot {
+    fn poll(host: &StaticHostInfo, prev: Option<CpuSample>) -> Self {
+        let uptime_secs = read_trimmed("/proc/uptime")
+            .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+            .unwrap_or(0.0) as u64;
+
+        let meminfo = read_trimmed("/proc/meminfo").unwrap_or_default();
+        let mut total = 0u64;
+        let mut avail = 0u64;
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                total = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                avail = rest.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            if total > 0 && avail > 0 {
+                break;
+            }
+        }
+
+        let curr_cpu = read_cpu_sample();
+        let cpu_pct = match (prev, curr_cpu) {
+            (Some(p), Some(c)) => {
+                let d_total = c.total.saturating_sub(p.total);
+                let d_idle = c.idle.saturating_sub(p.idle);
+                let d_used = d_total.saturating_sub(d_idle);
+                (d_used * 100).checked_div(d_total).unwrap_or(0).min(100) as u16
+            }
+            _ => 0,
+        };
+
+        let battery = host.battery_dir.as_ref().and_then(|dir| {
+            let pct = read_trimmed(dir.join("capacity"))?.parse().ok()?;
+            let status = read_trimmed(dir.join("status")).unwrap_or_else(|| "Unknown".into());
+            Some((pct, status))
+        });
+
+        let temp_c = host.thermal_zone.as_ref().and_then(|zone| {
+            let millideg: u32 = read_trimmed(zone.join("temp"))?.parse().ok()?;
+            Some((millideg / 1000) as u16)
+        });
+
+        Self {
+            uptime: format_uptime(uptime_secs),
+            load: read_trimmed("/proc/loadavg")
                 .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
                 .unwrap_or_else(|| "n/a".into()),
+            cpu_pct,
+            prev_cpu: curr_cpu,
             mem_used_mib: total.saturating_sub(avail) / 1024,
             mem_total_mib: total / 1024,
-            battery: battery(),
-            temp_c: cpu_temp(),
+            battery,
+            temp_c,
         }
     }
 }
@@ -622,25 +961,44 @@ struct App {
     menu: usize,
     focus: Focus,
     quit: bool,
+    rebuild: bool,
+    dirty: bool,
     dl: Downloader,
     settings: Settings,
+    host: StaticHostInfo,
     sys: SystemSnapshot,
     last_poll: Instant,
     history: Vec<HistoryEntry>,
+    history_idx: usize,
 }
 
 impl App {
     fn new() -> Self {
+        let host = StaticHostInfo::detect();
+        let first_cpu = read_cpu_sample();
+        let sys = SystemSnapshot::poll(&host, first_cpu);
         Self {
             menu: 0,
             focus: Focus::Sidebar,
             quit: false,
+            rebuild: false,
+            dirty: true,
             dl: Downloader::new(),
             settings: Settings::new(),
-            sys: SystemSnapshot::poll(),
+            host,
+            sys,
             last_poll: Instant::now(),
             history: Vec::new(),
+            history_idx: 0,
         }
+    }
+
+    fn trigger_rebuild(&mut self) {
+        if self.settings.is_dirty() {
+            let _ = self.settings.cfg.save();
+        }
+        self.rebuild = true;
+        self.quit = true;
     }
 
     fn palette(&self) -> Palette {
@@ -661,31 +1019,136 @@ impl App {
             subtitles: cfg.embed_subtitles,
             threads: cfg.concurrent_fragments,
         };
-        self.dl.job = spawn_download(req);
+        let (job, cancel) = spawn_download(req);
+        self.dl.job = job;
+        self.dl.cancel = cancel;
+        self.dl.last_seen_version = 0;
+        self.dl.started_at = Some(Instant::now());
         self.dl.step = Step::Running;
+        self.dirty = true;
     }
 
     fn reset_download(&mut self) {
         self.dl = Downloader::new();
+        self.dirty = true;
+    }
+
+    fn refresh_system(&mut self) {
+        self.host.refresh_tools();
+        self.sys = SystemSnapshot::poll(&self.host, self.sys.prev_cpu);
+        self.last_poll = Instant::now();
+        self.dirty = true;
     }
 
     /// Periodic housekeeping: refresh metrics and detect finished downloads.
     fn tick(&mut self) {
         if self.last_poll.elapsed() >= SYSTEM_REFRESH {
-            self.sys = SystemSnapshot::poll();
+            self.sys = SystemSnapshot::poll(&self.host, self.sys.prev_cpu);
             self.last_poll = Instant::now();
+            if self.selected() == Menu::Overview {
+                self.dirty = true;
+            }
         }
 
         if self.dl.step == Step::Running {
-            let state = self.dl.job.lock().unwrap().state;
+            let (state, version) = {
+                let job = self.dl.job.lock().unwrap();
+                (job.state, job.version)
+            };
+            if version != self.dl.last_seen_version {
+                self.dl.last_seen_version = version;
+                self.dirty = true;
+            }
             if state != JobState::Running {
+                let elapsed_secs = self
+                    .dl
+                    .started_at
+                    .map_or(0, |t| t.elapsed().as_secs());
                 self.history.push(HistoryEntry {
                     url: self.dl.url.trim().to_string(),
+                    kind: self.dl.kind(),
                     format: self.dl.format(),
-                    ok: state == JobState::Succeeded,
+                    state,
+                    elapsed_secs,
                 });
+                self.history_idx = 0;
                 self.dl.step = Step::Done;
+                self.dirty = true;
             }
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.dl.cancel_running();
+    }
+}
+
+fn project_dir() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if manifest_dir.join("Cargo.toml").is_file() {
+        manifest_dir
+    } else {
+        expand_tilde("~/.config/thinkbot")
+    }
+}
+
+fn rebuild_and_restart() -> io::Result<()> {
+    let dir = project_dir();
+    let manifest = dir.join("Cargo.toml");
+    println!(
+        "\x1b[1;36m↻ Updating & rebuilding thinkbot in {}...\x1b[0m",
+        dir.display()
+    );
+
+    if dir.join(".git").exists() {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["pull", "--ff-only"])
+            .status();
+    }
+
+    let build_status = Command::new("cargo")
+        .args(["build", "--release", "--manifest-path"])
+        .arg(&manifest)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+
+    let built_bin = dir.join("target/release/thinkbot");
+
+    match build_status {
+        Ok(s) if s.success() && built_bin.is_file() => {
+            // Also atomically update ~/.local/bin/thinkbot if ~/.local/bin exists.
+            if let Some(h) = home() {
+                let local_bin_dir = PathBuf::from(h).join(".local/bin");
+                if local_bin_dir.is_dir() {
+                    let tmp_bin = local_bin_dir.join(".thinkbot.rebuild.tmp");
+                    let dest_bin = local_bin_dir.join("thinkbot");
+                    if fs::copy(&built_bin, &tmp_bin).is_ok() {
+                        let _ = fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755));
+                        let _ = fs::rename(&tmp_bin, &dest_bin);
+                    }
+                }
+            }
+            println!("\x1b[1;32m✔ Build complete — restarting thinkbot...\x1b[0m");
+            let err = Command::new(&built_bin).args(env::args_os().skip(1)).exec();
+            Err(err)
+        }
+        _ => {
+            eprintln!(
+                "\n\x1b[1;31m✖ Rebuild failed.\x1b[0m Press Enter to relaunch previous build, or Ctrl+C to exit..."
+            );
+            let mut line = String::new();
+            let _ = io::stdin().read_line(&mut line);
+            if let Ok(exe) = env::current_exe() {
+                let err = Command::new(exe).args(env::args_os().skip(1)).exec();
+                return Err(err);
+            }
+            Ok(())
         }
     }
 }
@@ -693,37 +1156,87 @@ impl App {
 fn main() -> io::Result<()> {
     // `init` also installs a panic hook, so the terminal is restored on crash.
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal);
+    let (result, rebuild) = run(&mut terminal);
     ratatui::restore();
-    result
+    result?;
+    if rebuild {
+        rebuild_and_restart()?;
+    }
+    Ok(())
 }
 
-fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
+fn run(terminal: &mut DefaultTerminal) -> (io::Result<()>, bool) {
     let mut app = App::new();
     while !app.quit {
-        terminal.draw(|f| ui(f, &app))?;
+        if app.dirty {
+            if let Err(e) = terminal.draw(|f| ui(f, &app)) {
+                return (Err(e), false);
+            }
+            app.dirty = false;
+        }
 
-        if event::poll(TICK)? {
-            // Drain everything pending so a large paste costs one redraw.
-            loop {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        on_key(&mut app, key);
+        let timeout = if app.dl.step == Step::Running {
+            ACTIVE_TICK
+        } else {
+            IDLE_TICK.min(SYSTEM_REFRESH.saturating_sub(app.last_poll.elapsed()))
+        };
+
+        match event::poll(timeout) {
+            Ok(true) => {
+                // Drain everything pending so a large paste costs one redraw.
+                loop {
+                    match event::read() {
+                        Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                            on_key(&mut app, key);
+                            app.dirty = true;
+                        }
+                        Ok(Event::Paste(text)) => {
+                            on_paste(&mut app, &text);
+                            app.dirty = true;
+                        }
+                        Ok(Event::Resize(_, _)) => {
+                            app.dirty = true;
+                        }
+                        Ok(_) => {}
+                        Err(e) => return (Err(e), false),
+                    }
+                    match event::poll(Duration::ZERO) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => return (Err(e), false),
                     }
                 }
-                if !event::poll(Duration::ZERO)? {
-                    break;
-                }
             }
+            Ok(false) => {}
+            Err(e) => return (Err(e), false),
         }
         app.tick();
     }
-    Ok(())
+    app.dl.cancel_running();
+    (Ok(()), app.rebuild)
 }
 
 // ---------------------------------------------------------
 // Input
 // ---------------------------------------------------------
+
+fn on_paste(app: &mut App, text: &str) {
+    let clean: String = text.chars().filter(|&c| !c.is_control()).collect();
+    if clean.is_empty() {
+        return;
+    }
+    match (app.focus, app.selected()) {
+        (Focus::Content, Menu::Download) if app.dl.step == Step::Url => {
+            app.dl.url.push_str(&clean);
+        }
+        (Focus::Content, Menu::Settings) => {
+            if let Some(buf) = app.settings.editing.as_mut() {
+                buf.push_str(&clean);
+            }
+        }
+        _ => {}
+    }
+}
 
 fn on_key(app: &mut App, key: KeyEvent) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -733,6 +1246,7 @@ fn on_key(app: &mut App, key: KeyEvent) {
     match (app.focus, app.selected()) {
         (Focus::Sidebar, _) => sidebar_key(app, key.code),
         (Focus::Content, Menu::Download) => download_key(app, key),
+        (Focus::Content, Menu::Analytics) => analytics_key(app, key.code),
         (Focus::Content, Menu::Settings) => settings_key(app, key),
         (Focus::Content, _) => match key.code {
             KeyCode::Char('q') => app.quit = true,
@@ -745,8 +1259,14 @@ fn on_key(app: &mut App, key: KeyEvent) {
 fn sidebar_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
-        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if app.selected().is_enterable() => {
-            app.focus = Focus::Content;
+        KeyCode::Char('r') if app.selected() == Menu::Overview => app.refresh_system(),
+        KeyCode::Char('U') => app.trigger_rebuild(),
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            if app.selected() == Menu::Update {
+                app.trigger_rebuild();
+            } else if app.selected().is_enterable() {
+                app.focus = Focus::Content;
+            }
         }
         c => {
             if let Some(d) = vertical(c) {
@@ -768,7 +1288,7 @@ fn download_key(app: &mut App, key: KeyEvent) {
         },
         Step::Kind => match code {
             KeyCode::Esc => app.focus = Focus::Sidebar,
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 app.dl.format_idx = 0;
                 app.dl.step = Step::Format;
             }
@@ -789,17 +1309,52 @@ fn download_key(app: &mut App, key: KeyEvent) {
                 }
             }
         },
-        // The download keeps running in the background if you leave.
-        Step::Running => {
-            if code == KeyCode::Esc {
-                app.focus = Focus::Sidebar;
-            }
-        }
+        // The download keeps running in the background if you leave with Esc,
+        // or can be cancelled with 'c' / 'x'.
+        Step::Running => match code {
+            KeyCode::Esc => app.focus = Focus::Sidebar,
+            KeyCode::Char('c') | KeyCode::Char('x') => app.dl.cancel_running(),
+            _ => {}
+        },
         Step::Done => match code {
-            KeyCode::Enter | KeyCode::Char('r') => app.reset_download(),
+            KeyCode::Enter | KeyCode::Char('n') => app.reset_download(),
+            KeyCode::Char('r') => app.start_download(),
             c if c == KeyCode::Esc || is_back(c) => app.focus = Focus::Sidebar,
             _ => {}
         },
+    }
+}
+
+fn analytics_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => app.focus = Focus::Sidebar,
+        c if is_back(c) => app.focus = Focus::Sidebar,
+        KeyCode::Char('c') | KeyCode::Char('x') => {
+            app.history.clear();
+            app.history_idx = 0;
+        }
+        KeyCode::Enter | KeyCode::Char('r') if !app.history.is_empty() => {
+            // History is displayed newest-first, so map `history_idx` back to the slice index.
+            let rev_idx = app.history.len().saturating_sub(1 + app.history_idx);
+            if let Some(entry) = app.history.get(rev_idx) {
+                app.dl.url = entry.url.clone();
+                app.dl.kind_idx = Kind::ALL.iter().position(|&k| k == entry.kind).unwrap_or(0);
+                app.dl.format_idx = entry
+                    .kind
+                    .formats()
+                    .iter()
+                    .position(|&f| f == entry.format)
+                    .unwrap_or(0);
+                app.dl.step = Step::Format;
+                app.menu = Menu::ALL.iter().position(|&m| m == Menu::Download).unwrap_or(1);
+                app.focus = Focus::Content;
+            }
+        }
+        c => {
+            if let Some(d) = vertical(c) {
+                app.history_idx = wrap(app.history_idx, app.history.len(), d);
+            }
+        }
     }
 }
 
@@ -820,6 +1375,11 @@ fn settings_key(app: &mut App, key: KeyEvent) {
                 edit_text(buf, key);
             }
         }
+        return;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+        s.save();
         return;
     }
 
@@ -863,7 +1423,10 @@ fn val<'a>(text: impl Into<Cow<'a, str>>, color: Color) -> Span<'a> {
 }
 
 fn kv<'a>(label: &str, value: Span<'a>, p: &Palette) -> Line<'a> {
-    let key = Span::styled(format!(" {label:<9}"), Style::new().fg(p.primary).add_modifier(Modifier::BOLD));
+    let key = Span::styled(
+        format!(" {label:<9}"),
+        Style::new().fg(p.primary).add_modifier(Modifier::BOLD),
+    );
     Line::from(vec![key, value])
 }
 
@@ -875,12 +1438,29 @@ fn gauge(title: String, pct: u16, color: Color, p: &Palette) -> Gauge<'static> {
         .use_unicode(true)
 }
 
-fn render_choices(f: &mut Frame, area: Rect, title: &str, items: Vec<String>, selected: usize, accent: Color, p: &Palette) {
+fn render_choices(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    items: Vec<String>,
+    selected: usize,
+    accent: Color,
+    p: &Palette,
+) {
     let list = List::new(items)
         .block(panel(format!(" {title} "), p.dim))
-        .highlight_style(Style::new().bg(accent).fg(ON_ACCENT).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::new()
+                .bg(accent)
+                .fg(ON_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▸ ");
-    f.render_stateful_widget(list, area, &mut ListState::default().with_selected(Some(selected)));
+    f.render_stateful_widget(
+        list,
+        area,
+        &mut ListState::default().with_selected(Some(selected)),
+    );
 }
 
 // ---------------------------------------------------------
@@ -888,28 +1468,50 @@ fn render_choices(f: &mut Frame, area: Rect, title: &str, items: Vec<String>, se
 // ---------------------------------------------------------
 
 fn ui(f: &mut Frame, app: &App) {
-    let [side, main] = Layout::horizontal([Constraint::Length(26), Constraint::Min(40)]).areas(f.area());
-    render_sidebar(f, app, side);
+    let p = app.palette();
+    let [side, main] =
+        Layout::horizontal([Constraint::Length(28), Constraint::Min(40)]).areas(f.area());
+    render_sidebar(f, app, &p, side);
     match app.selected() {
-        Menu::Overview => render_overview(f, app, main),
-        Menu::Download => render_downloader(f, app, main),
-        Menu::Analytics => render_analytics(f, app, main),
-        Menu::Settings => render_settings(f, app, main),
-        Menu::Help => render_help(f, app, main),
+        Menu::Overview => render_overview(f, app, &p, main),
+        Menu::Download => render_downloader(f, app, &p, main),
+        Menu::Analytics => render_analytics(f, app, &p, main),
+        Menu::Settings => render_settings(f, app, &p, main),
+        Menu::Help => render_help(f, app, &p, main),
+        Menu::Update => render_update(f, app, &p, main),
     }
 }
 
-fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
-    let p = app.palette();
+fn render_sidebar(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     let focused = app.focus == Focus::Sidebar;
 
     let highlight = if focused {
-        Style::new().bg(p.primary).fg(ON_ACCENT).add_modifier(Modifier::BOLD)
+        Style::new()
+            .bg(p.primary)
+            .fg(ON_ACCENT)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::new().bg(p.surface).fg(p.text)
     };
 
-    let list = List::new(Menu::ALL.map(Menu::label))
+    let items: Vec<String> = Menu::ALL
+        .iter()
+        .map(|&m| match m {
+            Menu::Download if app.dl.step == Step::Running => {
+                let pct = app.dl.job.lock().map_or(0, |j| j.percent as u16);
+                format!("{} [{pct}%]", m.label())
+            }
+            Menu::Analytics if !app.history.is_empty() => {
+                format!("{} ({})", m.label(), app.history.len())
+            }
+            Menu::Settings if app.settings.is_dirty() => {
+                format!("{} *", m.label())
+            }
+            _ => m.label().to_string(),
+        })
+        .collect();
+
+    let list = List::new(items)
         .style(Style::new().fg(p.text))
         .block(
             panel(" Navigation ", if focused { p.primary } else { p.dim })
@@ -918,19 +1520,27 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .highlight_style(highlight)
         .highlight_symbol("▸ ");
 
-    f.render_stateful_widget(list, area, &mut ListState::default().with_selected(Some(app.menu)));
+    f.render_stateful_widget(
+        list,
+        area,
+        &mut ListState::default().with_selected(Some(app.menu)),
+    );
 }
 
-fn render_overview(f: &mut Frame, app: &App, area: Rect) {
-    let p = app.palette();
+fn render_overview(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     let sys = &app.sys;
+    let host = &app.host;
 
-    let frame = panel(" Host Environment ", p.primary);
+    let frame = panel(" Host Environment · r to refresh ", p.primary);
     let inner = frame.inner(area);
     f.render_widget(frame, area);
 
-    let [ident, gauges, env] =
-        Layout::vertical([Constraint::Length(6), Constraint::Length(3), Constraint::Min(4)]).areas(inner);
+    let [ident, gauges, env] = Layout::vertical([
+        Constraint::Length(6),
+        Constraint::Length(3),
+        Constraint::Min(5),
+    ])
+    .areas(inner);
 
     // Identity card, two columns
     let card_block = panel(" System ", p.dim);
@@ -944,30 +1554,49 @@ fn render_overview(f: &mut Frame, app: &App, area: Rect) {
     };
     f.render_widget(
         Paragraph::new(vec![
-            kv("OS", val(sys.os.as_str(), p.text), &p),
-            kv("Host", val(sys.host.as_str(), p.text), &p),
-            kv("Kernel", val(sys.kernel.as_str(), p.text), &p),
-            kv("Uptime", val(sys.uptime.as_str(), p.success), &p),
+            kv("OS", val(host.os.as_str(), p.text), p),
+            kv("Host", val(host.host.as_str(), p.text), p),
+            kv("Kernel", val(host.kernel.as_str(), p.text), p),
+            kv("Uptime", val(sys.uptime.as_str(), p.success), p),
         ]),
         left,
     );
     f.render_widget(
         Paragraph::new(vec![
-            kv("Desktop", val(sys.desktop.as_str(), p.text), &p),
-            kv("Root FS", val(sys.root_fs.as_str(), p.text), &p),
-            kv("Load", val(sys.load.as_str(), p.highlight), &p),
-            kv("CPU", temp, &p),
+            kv("Desktop", val(host.desktop.as_str(), p.text), p),
+            kv("Root FS", val(host.root_fs.as_str(), p.text), p),
+            kv("Load", val(sys.load.as_str(), p.highlight), p),
+            kv("Temp", temp, p),
         ]),
         right,
     );
 
-    // Gauges
-    let [mem_area, bat_area] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(gauges);
+    // Gauges: CPU, Memory, Power
+    let [cpu_area, mem_area, bat_area] = Layout::horizontal([
+        Constraint::Percentage(33),
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+    ])
+    .areas(gauges);
 
-    let mem_pct = if sys.mem_total_mib > 0 { (sys.mem_used_mib * 100 / sys.mem_total_mib) as u16 } else { 0 };
+    let cpu_color = if sys.cpu_pct > 85 {
+        p.danger
+    } else if sys.cpu_pct > 60 {
+        p.highlight
+    } else {
+        p.secondary
+    };
+    f.render_widget(
+        gauge(format!(" CPU · {}% ", sys.cpu_pct), sys.cpu_pct, cpu_color, p),
+        cpu_area,
+    );
+
+    let mem_pct = (sys.mem_used_mib * 100)
+        .checked_div(sys.mem_total_mib)
+        .unwrap_or(0) as u16;
     let mem_color = if mem_pct > 85 { p.danger } else { p.primary };
-    let mem_title = format!(" Memory · {} / {} MiB ", sys.mem_used_mib, sys.mem_total_mib);
-    f.render_widget(gauge(mem_title, mem_pct, mem_color, &p), mem_area);
+    let mem_title = format!(" Mem · {}/{} MiB ", sys.mem_used_mib, sys.mem_total_mib);
+    f.render_widget(gauge(mem_title, mem_pct, mem_color, p), mem_area);
 
     match &sys.battery {
         Some((pct, status)) => {
@@ -976,40 +1605,60 @@ fn render_overview(f: &mut Frame, app: &App, area: Rect) {
                 20..=49 => p.highlight,
                 _ => p.success,
             };
-            f.render_widget(gauge(format!(" Power · {status} "), *pct, color, &p), bat_area);
+            f.render_widget(
+                gauge(format!(" Power · {status} "), *pct, color, p),
+                bat_area,
+            );
         }
         None => f.render_widget(
-            Paragraph::new(" No battery detected").style(Style::new().fg(p.dim)).block(panel(" Power ", p.dim)),
+            Paragraph::new(" No battery")
+                .style(Style::new().fg(p.dim))
+                .block(panel(" Power ", p.dim)),
             bat_area,
         ),
     }
 
-    // Environment
-    let row = |label: &'static str, value: Span<'static>| {
+    // Environment & Tooling status
+    let row = |ok: bool, label: &'static str, value: Span<'static>| {
+        let dot = if ok {
+            val("● ", p.success)
+        } else {
+            val("✖ ", p.danger)
+        };
         Line::from(vec![
-            val("● ", p.success),
+            dot,
             Span::styled(format!("{label:<16}"), Style::new().add_modifier(Modifier::BOLD)),
             value,
         ])
     };
+    let tool_span = |installed: bool| {
+        if installed {
+            val("available in PATH", p.success)
+        } else {
+            val("missing from PATH", p.danger)
+        }
+    };
     let cfg = &app.settings.cfg;
     f.render_widget(
         Paragraph::new(vec![
-            row("Storage target", val(cfg.download_dir.clone(), p.highlight)),
-            row("Active theme", val(cfg.theme.name(), p.secondary)),
-            row("Threads", val(cfg.concurrent_fragments.to_string(), p.primary)),
-            Line::from(""),
-            Line::styled("This panel is read-only — use j/k to move around the sidebar.", Style::new().fg(p.dim)),
+            row(true, "Storage target", val(cfg.download_dir.clone(), p.highlight)),
+            row(true, "Active theme", val(cfg.theme.name(), p.secondary)),
+            row(
+                true,
+                "Threads",
+                val(cfg.concurrent_fragments.to_string(), p.primary),
+            ),
+            row(host.has_ytdlp, "yt-dlp", tool_span(host.has_ytdlp)),
+            row(host.has_ffmpeg, "ffmpeg", tool_span(host.has_ffmpeg)),
         ])
-        .block(panel(" Environment ", p.dim)),
+        .block(panel(" Environment & Dependencies ", p.dim)),
         env,
     );
 }
 
-fn render_downloader(f: &mut Frame, app: &App, area: Rect) {
+fn render_downloader(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     use Constraint::{Length, Min};
 
-    let p = app.palette();
     let focused = app.focus == Focus::Content;
     let dl = &app.dl;
 
@@ -1023,14 +1672,15 @@ fn render_downloader(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(frame, area);
 
     let heading = |lines: Vec<String>| {
-        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>()).style(Style::new().fg(p.highlight))
+        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+            .style(Style::new().fg(p.highlight))
     };
 
     match dl.step {
         Step::Url => {
             let [hint, input, _] = Layout::vertical([Length(2), Length(3), Min(0)]).areas(inner);
             let text = if focused {
-                "Step 1 of 3 — paste a URL, Enter to continue (Ctrl+U clears)"
+                "Step 1 of 3 — paste a URL, Enter to continue (Ctrl+U clear · Ctrl+W delete word)"
             } else {
                 "Press Enter to focus and paste a URL"
             };
@@ -1056,99 +1706,182 @@ fn render_downloader(f: &mut Frame, app: &App, area: Rect) {
                 head,
             );
             let items = Kind::ALL.iter().map(|k| format!(" {}", k.label())).collect();
-            render_choices(f, list, "Media Type", items, dl.kind_idx, p.primary, &p);
+            render_choices(f, list, "Media Type", items, dl.kind_idx, p.primary, p);
         }
         Step::Format => {
             let formats = dl.formats();
-            let [head, list, _] = Layout::vertical([Length(3), Length(formats.len() as u16 + 2), Min(0)]).areas(inner);
+            let [head, list, _] =
+                Layout::vertical([Length(3), Length(formats.len() as u16 + 2), Min(0)])
+                    .areas(inner);
             f.render_widget(
                 heading(vec![
                     format!("URL: {}", dl.url),
                     format!("Target directory: {}", app.settings.cfg.download_dir),
-                    "Step 3 of 3 — choose a format, Enter to run yt-dlp".into(),
+                    "Step 3 of 3 — choose a format, Enter to run yt-dlp (h to go back)".into(),
                 ]),
                 head,
             );
             let items = formats.iter().map(|fmt| format!(" .{fmt}")).collect();
-            render_choices(f, list, "Container / Codec", items, dl.format_idx, p.success, &p);
+            render_choices(f, list, "Container / Codec", items, dl.format_idx, p.success, p);
         }
         Step::Running | Step::Done => {
-            let (state, pct, lines) = {
+            let (state, pct, speed, eta, lines) = {
                 let job = dl.job.lock().unwrap();
-                let keep = if dl.step == Step::Running { inner.height as usize } else { 8 };
-                let start = job.lines.len().saturating_sub(keep);
-                let lines: Vec<Line> = job.lines[start..].iter().cloned().map(Line::from).collect();
-                (job.state, job.percent, lines)
+                let keep = if dl.step == Step::Running {
+                    inner.height.saturating_sub(6) as usize
+                } else {
+                    8
+                };
+                let skip = job.lines.len().saturating_sub(keep);
+                let lines: Vec<Line> = job
+                    .lines
+                    .iter()
+                    .skip(skip)
+                    .cloned()
+                    .map(Line::from)
+                    .collect();
+                (
+                    job.state,
+                    job.percent,
+                    job.speed.clone(),
+                    job.eta.clone(),
+                    lines,
+                )
             };
 
             let (headline, color) = match state {
                 JobState::Running => ("⏳ Downloading…", p.highlight),
                 JobState::Succeeded => ("✔ Download complete", p.success),
                 JobState::Failed => ("✖ Download failed", p.danger),
+                JobState::Cancelled => ("⊘ Download cancelled", p.dim),
+            };
+
+            let bar_title = match (state, speed, eta) {
+                (JobState::Running, Some(spd), Some(e)) => {
+                    format!(" Progress · {spd} · ETA {e} ")
+                }
+                (JobState::Running, Some(spd), None) => format!(" Progress · {spd} "),
+                _ => " Progress ".into(),
             };
 
             let [head, bar, log, foot] =
                 Layout::vertical([Length(2), Length(3), Min(1), Length(1)]).areas(inner);
             f.render_widget(
-                Paragraph::new(headline).style(Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                Paragraph::new(headline)
+                    .style(Style::new().fg(color).add_modifier(Modifier::BOLD)),
                 head,
             );
-            f.render_widget(gauge(" Progress ".into(), pct as u16, color, &p), bar);
+            f.render_widget(gauge(bar_title, pct as u16, color, p), bar);
             f.render_widget(
-                Paragraph::new(lines).style(Style::new().fg(p.text)).wrap(Wrap { trim: true }),
+                Paragraph::new(lines)
+                    .style(Style::new().fg(p.text))
+                    .wrap(Wrap { trim: true }),
                 log,
             );
             let hint = if state == JobState::Running {
-                "Esc: back to sidebar (download continues)"
+                "c: cancel download · Esc: back to sidebar (download continues)"
             } else {
-                "Enter / r: download another · Esc: back to sidebar"
+                "Enter / n: new download · r: retry same URL · Esc: back to sidebar"
             };
             f.render_widget(Paragraph::new(hint).style(Style::new().fg(p.dim)), foot);
         }
     }
 }
 
-fn render_analytics(f: &mut Frame, app: &App, area: Rect) {
-    let p = app.palette();
+fn render_analytics(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
+    use Constraint::{Length, Min};
+
     let focused = app.focus == Focus::Content;
+    let title = if focused {
+        " Session Analytics · Esc to return "
+    } else {
+        " Session Analytics · Enter to inspect "
+    };
+    let frame = panel(title, if focused { p.primary } else { p.dim });
+    let inner = frame.inner(area);
+    f.render_widget(frame, area);
 
-    let ok = app.history.iter().filter(|h| h.ok).count();
-    let failed = app.history.len() - ok;
+    let ok = app
+        .history
+        .iter()
+        .filter(|h| h.state == JobState::Succeeded)
+        .count();
+    let cancelled = app
+        .history
+        .iter()
+        .filter(|h| h.state == JobState::Cancelled)
+        .count();
+    let failed = app.history.len() - ok - cancelled;
 
-    let mut lines = vec![
-        Line::from(vec![
-            val("✔ ", p.success),
-            Span::raw(format!("{ok} completed    ")),
-            val("✖ ", p.danger),
-            Span::raw(format!("{failed} failed")),
-        ]),
-        Line::from(""),
-    ];
+    let [summary_a, list_a, foot_a] =
+        Layout::vertical([Length(2), Min(1), Length(1)]).areas(inner);
+
+    let summary = Line::from(vec![
+        val("✔ ", p.success),
+        Span::raw(format!("{ok} completed    ")),
+        val("✖ ", p.danger),
+        Span::raw(format!("{failed} failed    ")),
+        val("⊘ ", p.dim),
+        Span::raw(format!("{cancelled} cancelled")),
+    ]);
+    f.render_widget(Paragraph::new(summary), summary_a);
+
     if app.history.is_empty() {
-        lines.push(Line::styled(
-            "Nothing downloaded yet — open Download Media to get started.",
-            Style::new().fg(p.dim),
-        ));
-    }
-    for h in app.history.iter().rev() {
-        let (icon, color) = if h.ok { ("✔", p.success) } else { ("✖", p.danger) };
-        lines.push(Line::from(vec![
-            val(format!("{icon} "), color),
-            val(format!(".{:<5} ", h.format), p.highlight),
-            Span::raw(h.url.as_str()),
-        ]));
+        f.render_widget(
+            Paragraph::new("Nothing downloaded yet — open Download Media to get started.")
+                .style(Style::new().fg(p.dim)),
+            list_a,
+        );
+    } else {
+        let items: Vec<Line> = app
+            .history
+            .iter()
+            .rev()
+            .map(|h| {
+                let (icon, color) = match h.state {
+                    JobState::Succeeded => ("✔", p.success),
+                    JobState::Cancelled => ("⊘", p.dim),
+                    _ => ("✖", p.danger),
+                };
+                Line::from(vec![
+                    val(format!(" {icon} "), color),
+                    val(format!(".{:<5} ", h.format), p.highlight),
+                    val(format!("{:>3}s  ", h.elapsed_secs), p.dim),
+                    Span::styled(h.url.as_str(), Style::new().fg(p.text)),
+                ])
+            })
+            .collect();
+
+        let highlight = if focused {
+            Style::new()
+                .bg(p.surface)
+                .fg(p.highlight)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+
+        let list = List::new(items)
+            .highlight_style(highlight)
+            .highlight_symbol(if focused { "▸" } else { " " });
+        let selected = focused.then_some(app.history_idx);
+        f.render_stateful_widget(list, list_a, &mut ListState::default().with_selected(selected));
     }
 
+    let foot_text = if focused && !app.history.is_empty() {
+        "j/k select · Enter/r retry download · c clear history · Esc back"
+    } else {
+        "Press Enter from sidebar to select or retry past downloads"
+    };
     f.render_widget(
-        Paragraph::new(lines).block(panel(" Session Analytics ", if focused { p.primary } else { p.dim })),
-        area,
+        Paragraph::new(foot_text).style(Style::new().fg(p.dim)),
+        foot_a,
     );
 }
 
-fn render_settings(f: &mut Frame, app: &App, area: Rect) {
+fn render_settings(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
     use Constraint::{Length, Min, Percentage};
 
-    let p = app.palette();
     let focused = app.focus == Focus::Content;
     let s = &app.settings;
     let active = |field: Field| focused && s.field() == field;
@@ -1156,7 +1889,11 @@ fn render_settings(f: &mut Frame, app: &App, area: Rect) {
     let accent = |t: String| Span::styled(t, Style::new().fg(p.primary).add_modifier(Modifier::BOLD));
 
     let frame = panel(
-        if focused { " Settings · Esc to return " } else { " Settings · Enter to configure " },
+        if focused {
+            " Settings · Esc to return "
+        } else {
+            " Settings · Enter to configure "
+        },
         if focused { p.secondary } else { p.dim },
     );
     let inner = frame.inner(area);
@@ -1167,35 +1904,56 @@ fn render_settings(f: &mut Frame, app: &App, area: Rect) {
     let [subs_a, threads_a] = Layout::horizontal([Percentage(50), Percentage(50)]).areas(flags_a);
 
     // Download directory
+    let max_path_chars = path_a.width.saturating_sub(30) as usize;
     let path_line = match &s.editing {
-        Some(buf) => Line::from(vec![
-            Span::styled(format!("{buf}█"), Style::new().fg(p.highlight).add_modifier(Modifier::BOLD)),
-            hint("   Enter save · Esc cancel"),
+        Some(buf) => {
+            let shown = tail_chars(buf, max_path_chars.max(10));
+            Line::from(vec![
+                Span::styled(
+                    format!("{shown}█"),
+                    Style::new().fg(p.highlight).add_modifier(Modifier::BOLD),
+                ),
+                hint("   Enter confirm · Esc cancel"),
+            ])
+        }
+        None => Line::from(vec![
+            val(s.cfg.download_dir.as_str(), p.text),
+            hint("   Enter to edit"),
         ]),
-        None => Line::from(vec![val(s.cfg.download_dir.as_str(), p.text), hint("   Enter to edit")]),
     };
     f.render_widget(
-        Paragraph::new(path_line).block(card("Download directory", active(Field::Path), &p)),
+        Paragraph::new(path_line).block(card("Download directory", active(Field::Path), p)),
         path_a,
     );
 
     // Theme
+    let theme_idx = Theme::ALL.iter().position(|&t| t == s.cfg.theme).unwrap_or(0) + 1;
     f.render_widget(
         Paragraph::new(Line::from(vec![
             accent("◂ ".into()),
             accent(s.cfg.theme.name().into()),
-            accent(" ▸".into()),
+            accent(" ▸ ".into()),
+            val(format!("({theme_idx}/{})  ", Theme::ALL.len()), p.dim),
+            val("██", p.primary),
+            val("██", p.secondary),
+            val("██", p.highlight),
+            val("██", p.success),
+            val("██", p.danger),
             hint("   h/l to switch"),
         ]))
-        .block(card("Colour scheme", active(Field::Theme), &p)),
+        .block(card("Colour scheme", active(Field::Theme), p)),
         theme_a,
     );
 
     // Subtitles
-    let subs = if s.cfg.embed_subtitles { val("● On", p.success) } else { val("○ Off", p.dim) };
+    let subs = if s.cfg.embed_subtitles {
+        val("● On", p.success)
+    } else {
+        val("○ Off", p.dim)
+    };
     f.render_widget(
         Paragraph::new(Line::from(vec![subs, hint("   embeds EN subs (video)")]))
-            .block(card("Auto subtitles", active(Field::Subtitles), &p)),
+            .block(card("Auto subtitles", active(Field::Subtitles), p)),
         subs_a,
     );
 
@@ -1205,63 +1963,219 @@ fn render_settings(f: &mut Frame, app: &App, area: Rect) {
             accent(format!("◂ {} ▸", s.cfg.concurrent_fragments)),
             hint("   h/l to adjust"),
         ]))
-        .block(card("Download threads", active(Field::Threads), &p)),
+        .block(card("Download threads", active(Field::Threads), p)),
         threads_a,
     );
 
     // Save button + status
     let button = if active(Field::Save) {
-        Style::new().bg(p.success).fg(ON_ACCENT).add_modifier(Modifier::BOLD)
+        Style::new()
+            .bg(p.success)
+            .fg(ON_ACCENT)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::new().bg(p.surface).fg(p.text)
     };
-    let status = match &s.status {
-        Some((msg, ok)) => Span::styled(
+    let status = match (&s.status, s.is_dirty()) {
+        (Some((msg, ok)), _) => Span::styled(
             msg.as_str(),
-            Style::new().fg(if *ok { p.success } else { p.danger }).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(if *ok { p.success } else { p.danger })
+                .add_modifier(Modifier::BOLD),
         ),
-        None => hint("Enter to write config to disk"),
+        (None, true) => val("● Unsaved changes (Enter or Ctrl+S to save)", p.highlight),
+        (None, false) => hint("Enter or Ctrl+S to write config to disk"),
+    };
+    let save_label = if s.is_dirty() {
+        " Save settings * "
+    } else {
+        " Save settings "
     };
     f.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(" Save settings ", button), Span::raw("  "), status])),
+        Paragraph::new(Line::from(vec![
+            Span::styled(save_label, button),
+            Span::raw("  "),
+            status,
+        ])),
         save_a,
     );
 
     f.render_widget(
-        Paragraph::new("j/k move · h/l adjust · Enter edit / toggle · Esc back").style(Style::new().fg(p.dim)),
+        Paragraph::new("j/k move · h/l adjust · Enter edit / toggle · Ctrl+S save · Esc back")
+            .style(Style::new().fg(p.dim)),
         footer_a,
     );
 }
 
-fn render_help(f: &mut Frame, app: &App, area: Rect) {
-    let p = app.palette();
-    let section = |t: &'static str| Line::styled(t, Style::new().fg(p.highlight).add_modifier(Modifier::BOLD));
+fn render_help(f: &mut Frame, _app: &App, p: &Palette, area: Rect) {
+    let section = |t: &'static str| {
+        Line::styled(t, Style::new().fg(p.highlight).add_modifier(Modifier::BOLD))
+    };
     let key = |k: &'static str, d: &'static str| {
-        Line::from(vec![Span::styled(format!("  {k:<18}"), Style::new().fg(p.primary)), Span::raw(d)])
+        Line::from(vec![
+            Span::styled(format!("  {k:<18}"), Style::new().fg(p.primary)),
+            Span::raw(d),
+        ])
     };
 
     let lines = vec![
         section("Anywhere"),
-        key("Ctrl+C", "Quit"),
+        key("Ctrl+C", "Quit immediately"),
         Line::from(""),
         section("Sidebar"),
         key("j/k  ↑/↓", "Move selection"),
-        key("Enter  l  →", "Open the selected panel"),
+        key("Enter  l  →", "Open panel (or trigger Update & Reboot)"),
+        key("r", "Refresh system metrics (on System Overview)"),
+        key("Shift+U", "Instant rebuild & restart from anywhere in sidebar"),
         key("q  Esc", "Quit"),
         Line::from(""),
-        section("Inside a panel"),
-        key("j/k  ↑/↓", "Move between options"),
-        key("Enter", "Confirm, advance or toggle"),
-        key("h  ←  Backspace", "Go back / decrease"),
-        key("l  →", "Increase / next"),
-        key("Esc", "Return to the sidebar"),
+        section("Downloader & Analytics"),
+        key("j/k  ↑/↓", "Move between options or history entries"),
+        key("Enter", "Confirm, advance, or retry selected download"),
+        key("c  x", "Cancel running download / clear analytics history"),
+        key("r", "Retry finished or selected download"),
+        key("h  ←  Backspace", "Go back / return to sidebar"),
+        key("Esc", "Return to the sidebar (active download continues)"),
         Line::from(""),
-        section("Text fields"),
-        key("Ctrl+U", "Clear the field"),
+        section("Settings & Text Fields"),
+        key("h/l  ←/→", "Adjust setting value"),
+        key("Ctrl+S", "Save configuration to disk"),
+        key("Ctrl+U", "Clear text field"),
+        key("Ctrl+W", "Delete previous word / path segment"),
     ];
 
     f.render_widget(
-        Paragraph::new(lines).style(Style::new().fg(p.text)).block(panel(" Help ", p.dim)),
+        Paragraph::new(lines)
+            .style(Style::new().fg(p.text))
+            .block(panel(" Help ", p.dim)),
         area,
     );
+}
+
+fn render_update(f: &mut Frame, app: &App, p: &Palette, area: Rect) {
+    let dir = project_dir();
+    let bin = dir.join("target/release/thinkbot");
+    let button = Style::new()
+        .bg(p.primary)
+        .fg(ON_ACCENT)
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines = vec![
+        Line::styled(
+            " Update, Rebuild & Restart",
+            Style::new().fg(p.highlight).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
+        kv("Project", val(dir.display().to_string(), p.text), p),
+        kv("Binary", val(bin.display().to_string(), p.text), p),
+        Line::from(""),
+        Line::styled(
+            " Pressing Enter on this sidebar item will:",
+            Style::new().fg(p.secondary).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(vec![
+            val("  1. ", p.primary),
+            Span::raw("Save any unsaved configuration changes"),
+        ]),
+        Line::from(vec![
+            val("  2. ", p.primary),
+            Span::raw("Close the TUI and pull latest git changes (git pull --ff-only)"),
+        ]),
+        Line::from(vec![
+            val("  3. ", p.primary),
+            Span::raw("Run cargo build --release and update ~/.local/bin/thinkbot"),
+        ]),
+        Line::from(vec![
+            val("  4. ", p.primary),
+            Span::raw("Immediately reboot into the newly compiled thinkbot binary"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(" ↻ Press Enter (or l / →) to Rebuild & Reboot Now ", button),
+        ]),
+    ];
+
+    if app.settings.is_dirty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            " ● Unsaved settings will be automatically saved before rebooting.",
+            Style::new().fg(p.highlight),
+        ));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .style(Style::new().fg(p.text))
+            .block(panel(" Update & Reboot ", p.primary)),
+        area,
+    );
+}
+
+// ---------------------------------------------------------
+// Tests
+// ---------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_cycles_both_directions() {
+        assert_eq!(wrap(0, 5, -1), 4);
+        assert_eq!(wrap(4, 5, 1), 0);
+        assert_eq!(wrap(2, 5, 2), 4);
+        assert_eq!(wrap(0, 0, 1), 0);
+    }
+
+    #[test]
+    fn tail_chars_handles_unicode_and_bounds() {
+        assert_eq!(tail_chars("abcdef", 3), "def");
+        assert_eq!(tail_chars("abc", 10), "abc");
+        assert_eq!(tail_chars("αβγδε", 2), "δε");
+        assert_eq!(tail_chars("", 5), "");
+    }
+
+    #[test]
+    fn format_uptime_formats_days_and_hours() {
+        assert_eq!(format_uptime(3661), "1h 1m");
+        assert_eq!(format_uptime(90061), "1d 1h 1m");
+    }
+
+    #[test]
+    fn job_collapses_progress_and_extracts_speed_eta() {
+        let mut job = Job::default();
+        job.push("[download] Destination: video.mp4");
+        job.push("[download]  12.5% of   50.00MiB at    4.20MiB/s ETA 00:10");
+        job.push("[download]  45.0% of   50.00MiB at    6.10MiB/s ETA 00:05");
+
+        assert_eq!(job.lines.len(), 2);
+        assert!((job.percent - 45.0).abs() < f64::EPSILON);
+        assert_eq!(job.speed.as_deref(), Some("6.10MiB/s"));
+        assert_eq!(job.eta.as_deref(), Some("00:05"));
+    }
+
+    #[test]
+    fn edit_text_supports_word_deletion_and_clear() {
+        let mut buf = String::from("https://example.com/watch?v=123");
+        edit_text(
+            &mut buf,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(buf, "https://example.com/watch?");
+
+        edit_text(
+            &mut buf,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn theme_cycle_wraps_around() {
+        let first = Theme::ALL[0];
+        let last = Theme::ALL[Theme::ALL.len() - 1];
+        assert_eq!(first.cycle(-1), last);
+        assert_eq!(last.cycle(1), first);
+    }
 }
